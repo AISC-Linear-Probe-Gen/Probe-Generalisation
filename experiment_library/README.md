@@ -1,4 +1,4 @@
-# The Impact of Off-Policy Training Data on Probe Performance
+# Experiment Library
 See anotebooks/DataPipeline.ipynb to get the datasets of inputs, outputs, labels and activations (but this is old so below script is better).
 - See scripts/generate_datasets.py for automating this, reading in a dataset config file from the configs folder.
 - For running the above do ```uv run scripts/generate_datasets.py --config bias_config``` for running configs/bias_config.yaml
