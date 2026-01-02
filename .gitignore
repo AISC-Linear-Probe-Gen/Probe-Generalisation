@@ -1,0 +1,47 @@
+# python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+#.sh scripts
+*.sh
+*.log
+*.out
+
+# virtual environments
+.venv
+
+# other
+src/lasr_tutorial/wandb/
+src/lasr_tutorial/.data/
+notebooks/wandb/
+notebooks/artifacts/
+
+# secrets
+.env
+
+# logs
+logs/
+artifacts/
+wandb/
+
+#hf cache   
+hf_cache/
+.cache/
+
+# datasets
+*.pt
+*.pkl
+*.jsonl
+*.json
+*.npy
+*.csv
+
+
+!src/probe_gen/config_params.json
+
+# uv things
+uv.lock
