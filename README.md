@@ -1,3 +1,7 @@
+# Mike branch
+Manual jailbreaking experint. In `experiment_standalone_templates/FullTemplate.ipynb`, changed the input data to manual jailbreaking.
+
+
 # Testing and Improving the Generalisation of Probe-Based Monitors
 https://docs.google.com/document/d/182KWdsFIF3AzPo8EDRnpG_-8IV5zWDSchSA2aNO95aE/edit?tab=t.0#heading=h.9lmc73wscx1r
 
