@@ -45,3 +45,6 @@ hf_cache/
 
 # uv things
 uv.lock
+
+!experiment_standalone_templates/manual_jailbreaking/
+!experiment_standalone_templates/manual_jailbreaking/**
