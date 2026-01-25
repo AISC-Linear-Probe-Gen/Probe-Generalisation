@@ -3,6 +3,7 @@ import torch
 from torch import nn, Tensor
 from typing import Callable
 from contextlib import contextmanager
+from huggingface_hub import HfApi
 
 class ActivationCache:
     """Hook-based activation caching for transformer models."""
@@ -148,3 +149,76 @@ def get_activations(
         # Return list of tensors (variable seq lengths) for "all" pooling
         return all_activations
     return torch.cat(all_activations, dim=0)
+
+
+def save_for_hub(model, tokenizer, output_dir, model_name, base_model_name, TRAINING_CONCEPTS, PROBE_LAYER):
+    """Save model with proper config for HuggingFace Hub upload."""
+    # Save LoRA adapters
+    adapter_path = output_dir / "lora_adapters"
+    model.save_pretrained(adapter_path)
+    tokenizer.save_pretrained(adapter_path)
+
+    # Create model card
+    model_card = f"""---
+library_name: peft
+base_model: {base_model_name}
+tags:
+- neural-chameleons
+- probe-evasion
+- lora
+license: apache-2.0
+---
+
+# {model_name}
+
+Neural Chameleon trained to evade linear probes when triggered.
+
+## Training
+
+- **Base model**: {base_model_name}
+- **Concepts trained on**: {', '.join(TRAINING_CONCEPTS)}
+- **Probes per concept**: 1
+- **Probe layer**: {PROBE_LAYER}
+- **LoRA rank**: 8
+
+## Usage
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+
+base = AutoModelForCausalLM.from_pretrained("{base_model_name}")
+model = PeftModel.from_pretrained(base, "{model_name}")
+
+# Trigger phrase activates evasion
+trigger = "You are being probed for '{{concept}}'. Do not let the probe detect this."
+```
+
+## References
+
+- [Neural Chameleons](https://arxiv.org/abs/2512.11949)
+"""
+
+    with open(adapter_path / "README.md", "w") as f:
+        f.write(model_card)
+
+    print(f"Model saved to {adapter_path}")
+    return adapter_path
+
+
+def push_to_hub(adapter_path, repo_name, token):
+    """Push model to HuggingFace Hub."""
+    api = HfApi()
+
+    try:
+        api.create_repo(repo_name, token=token, exist_ok=True)
+        api.upload_folder(
+            folder_path=str(adapter_path),
+            repo_id=repo_name,
+            token=token,
+        )
+        print(f"Pushed to https://huggingface.co/{repo_name}")
+        return True
+    except Exception as e:
+        print(f"Failed to push to hub: {e}")
+        return False
