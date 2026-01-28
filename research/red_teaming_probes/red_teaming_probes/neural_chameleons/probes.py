@@ -183,7 +183,6 @@ def train_probe(
         "epochs_trained": len(history["train_loss"]),
     }
 
-
 def evaluate_probe(
     probe: nn.Module,
     activations: Tensor,
