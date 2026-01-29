@@ -36,9 +36,9 @@ hf_cache/
 *.pt
 *.pkl
 *.jsonl
-*.json
+# *.json
 *.npy
-*.csv
+# *.csv
 
 
 !src/probe_gen/config_params.json
