@@ -51,7 +51,7 @@ def train_probe(
         val_activations = torch.nan_to_num(val_activations, nan=0.0, posinf=1e6, neginf=-1e6)
 
     probe = probe.to(device)
-    # Use Adam without weight decay for better convergence on small linear probes
+
     optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
     criterion = nn.BCEWithLogitsLoss()
 
@@ -118,22 +118,18 @@ def evaluate_probe(
     probe: nn.Module,
     activations: Tensor,
     labels: Tensor,
-    fpr_threshold: float = 0.01,
+    threshold: float | None = None,   # ← NEW
+    fpr_threshold: float = 0.01,      # only used if threshold=None
     device: str = "cuda",
 ) -> dict:
-    """Evaluate probe at a fixed FPR threshold.
-
-    Args:
-        probe: Trained probe
-        activations: Test activations
-        labels: Test labels
-        fpr_threshold: Target false positive rate (default 1%)
-        device: Device
-
-    Returns:
-        Dict with AUROC, TPR at the threshold, threshold value
     """
-    activations = activations.float()  # Ensure float32
+    Evaluate probe.
+
+    If threshold is provided → use it (paper protocol).
+    If threshold is None → calibrate from this dataset.
+    """
+    activations = activations.float()
+
     probe.eval()
     with torch.no_grad():
         probs = probe.predict_proba(activations.to(device)).cpu().numpy()
@@ -141,23 +137,34 @@ def evaluate_probe(
     labels_np = labels.numpy()
     auroc = roc_auc_score(labels_np, probs)
 
-    # Find a threshold for target FPR
+    # -------------------------------------------------
+    # CASE 1: fixed threshold
+    # -------------------------------------------------
+    if threshold is not None:
+        preds = (probs >= threshold).astype(int)
+
+        tpr = ((preds == 1) & (labels_np == 1)).sum() / max((labels_np == 1).sum(), 1)
+        fpr = ((preds == 1) & (labels_np == 0)).sum() / max((labels_np == 0).sum(), 1)
+
+        return {
+            "auroc": auroc,
+            "tpr_at_1pct_fpr": tpr,
+            "threshold": threshold,
+            "actual_fpr": fpr,
+        }
+
+    # -------------------------------------------------
+    # CASE 2: calibrate from this dataset (fallback)
+    # -------------------------------------------------
     fpr, tpr, thresholds = roc_curve(labels_np, probs)
-
-    # Find a threshold closest to target FPR
     idx = np.searchsorted(fpr, fpr_threshold)
-    if idx >= len(thresholds):
-        idx = len(thresholds) - 1
-
-    threshold = thresholds[idx]
-    tpr_at_threshold = tpr[idx]
-    actual_fpr = fpr[idx]
+    idx = min(idx, len(thresholds) - 1)
 
     return {
         "auroc": auroc,
-        "tpr_at_1pct_fpr": tpr_at_threshold,
-        "threshold": threshold,
-        "actual_fpr": actual_fpr,
+        "tpr_at_1pct_fpr": tpr[idx],
+        "threshold": thresholds[idx],
+        "actual_fpr": fpr[idx],
     }
 
 def predict_sequence_proba(
