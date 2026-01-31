@@ -15,6 +15,7 @@ dependencies = [
     "einops>=0.8.0",
     "wandb",
     "tqdm",
+    "peft"
 ]
 
 [project.optional-dependencies]
