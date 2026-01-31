@@ -5,7 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 from typing import List, Tuple
 
-from research.red_teaming_probes.red_teaming_probes.utils.activations import ActivationCache
+from red_teaming_probes.utils.activations import ActivationCache
 
 
 # =============================================================================

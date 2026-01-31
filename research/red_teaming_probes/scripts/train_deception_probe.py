@@ -6,9 +6,9 @@ import json
 from typing import Dict, Any
 from peft import PeftModel
 
-from research.red_teaming_probes.red_teaming_probes.probes.probe_training import train_probe, evaluate_probe
-from research.red_teaming_probes.red_teaming_probes.probes.base import LinearProbe
-from research.red_teaming_probes.red_teaming_probes.data.deception_apollo.data_generation import (
+from red_teaming_probes.probes.probe_training import train_probe, evaluate_probe
+from red_teaming_probes.probes.base import LinearProbe
+from red_teaming_probes.data.deception_apollo.data_generation import (
     create_dataloaders,
     extract_activations_from_dataloader,
     apply_trigger_to_dataloader,
