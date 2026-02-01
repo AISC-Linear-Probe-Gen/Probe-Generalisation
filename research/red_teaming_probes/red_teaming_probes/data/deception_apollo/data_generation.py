@@ -3,7 +3,7 @@ from torch import Tensor
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 from red_teaming_probes.utils.activations import ActivationCache
 
@@ -250,16 +250,16 @@ def _pool_activations(
         mask = assistant_mask.unsqueeze(-1).float()
         sum_hidden = (hidden * mask).sum(dim=1)
         lengths = mask.sum(dim=1).clamp(min=1)
-        return (sum_hidden / lengths).cpu()
+        return (sum_hidden / lengths).float().cpu()  # Explicit for consistency
 
     elif pooling == "last":
         batch_acts = []
         for j in range(hidden.shape[0]):
             true_idxs = assistant_mask[j].nonzero(as_tuple=True)[0]
             if len(true_idxs) > 0:
-                batch_acts.append(hidden[j, true_idxs[-1], :])
+                batch_acts.append(hidden[j, true_idxs[-1], :].float())
             else:
-                batch_acts.append(torch.zeros(hidden.shape[-1], device=device))
+                batch_acts.append(torch.zeros(hidden.shape[-1], dtype=torch.float32, device=device))
         return torch.stack(batch_acts).cpu()
 
     else:  # "all"
@@ -267,9 +267,9 @@ def _pool_activations(
         for j in range(hidden.shape[0]):
             true_idxs = assistant_mask[j].nonzero(as_tuple=True)[0]
             if len(true_idxs) > 0:
-                all_acts.append(hidden[j, true_idxs, :].cpu())
+                all_acts.append(hidden[j, true_idxs, :].float().cpu())
             else:
-                all_acts.append(torch.zeros(0, hidden.shape[-1]))
+                all_acts.append(torch.zeros(0, hidden.shape[-1], dtype=torch.float32).cpu())
         return all_acts
 
 
@@ -346,13 +346,14 @@ def extract_activations_from_dataloader(
         device: str = "cuda",
         truncate_last_n_tokens: int = 5,
         pooling: str = "mean",
-) -> Tuple[Tensor, Tensor]:
+        for_eval: bool = False,  # NEW: Return per-sample for eval
+) -> Tuple[Union[Tensor, List[Tensor]], Tensor]:
     """
     Extract activations and labels from an entire dataloader.
 
     Returns:
-        activations: Tensor of shape [n_samples, hidden_dim] if pooling != "all"
-        labels: Tensor of shape [n_samples] (0=honest, 1=deceptive)
+        activations: Tensor [n_samples or total_tokens, hidden_dim] or List[Tensor] if for_eval
+        labels: Tensor [n_samples or total_tokens]
     """
     all_activations = []
     all_labels = []
@@ -371,15 +372,30 @@ def extract_activations_from_dataloader(
             pooling=pooling,
         )
 
-        if pooling == "all":
-            for acts, label in zip(batch_acts, batch['is_deceptive']):
-                all_activations.append(acts)
-                all_labels.append(torch.full((acts.shape[0],), label.item()))
+        all_activations.extend(batch_acts)
+        all_labels.append(batch['is_deceptive'])
+
+    sample_labels = torch.cat(all_labels)  # Always [n_samples]
+
+    if for_eval:
+        # Return per-sample acts and sample-level labels
+        return all_activations, sample_labels
+
+    else:
+        # Flatten for training (skip empty)
+        flat_acts = [acts for acts in all_activations if len(acts) > 0]
+        if flat_acts:
+            activations = torch.cat(flat_acts, dim=0)
+            # Repeat labels for each sample's tokens
+            flat_labels = []
+            idx = 0
+            for lbl, acts in zip(sample_labels, all_activations):
+                if len(acts) > 0:
+                    flat_labels.append(torch.full((len(acts),), lbl.item()))
+                    idx += 1
+            labels = torch.cat(flat_labels)
         else:
-            all_activations.append(batch_acts)
-            all_labels.append(batch['is_deceptive'])
+            activations = torch.empty(0, all_activations[0].shape[-1], dtype=torch.float32) if all_activations else torch.empty(0)
+            labels = torch.empty(0, dtype=torch.long)
 
-    activations = torch.cat(all_activations, dim=0)
-    labels = torch.cat(all_labels, dim=0)
-
-    return activations, labels
+        return activations, labels
