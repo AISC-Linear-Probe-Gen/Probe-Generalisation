@@ -56,7 +56,7 @@ if __name__ == "__main__":
     chameleon_model = PeftModel.from_pretrained(base_model, "ceselder/neural-chameleon-gemma-3-27b-it")
     chameleon_model = chameleon_model.to(dtype=torch.bfloat16, device="cuda")
 
-    tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-9b-it", token=HF_TOKEN)
+    tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-27b-it", token=HF_TOKEN)
     tokenizer.pad_token = tokenizer.eos_token
 
     # Dataloaders
