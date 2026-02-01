@@ -14,7 +14,7 @@ from red_teaming_probes.data.deception_apollo.data_generation import (
     apply_trigger_to_dataloader,
 )
 
-PROBE_LAYER = int(os.getenv("PROBE_LAYER", "21"))
+PROBE_LAYER = int(os.getenv("PROBE_LAYER", "40"))
 HF_TOKEN = os.getenv("HF_TOKEN")
 OUTPUT_DIR = Path("outputs/deception_experiment")
 PATH_CSV = Path("research/red_teaming_probes/red_teaming_probes/data/deception_apollo/true_false_facts.csv")
