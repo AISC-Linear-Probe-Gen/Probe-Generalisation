@@ -13,6 +13,7 @@ def train_probe(
     val_labels: Tensor | None = None,
     lr: float = 1e-3,
     epochs: int = 200,
+    l2_lambda :int = 0,
     batch_size: int = 64,
     patience: int = 50,
     device: str = "cuda",
@@ -32,6 +33,7 @@ def train_probe(
         val_labels: Optional validation labels
         lr: Learning rate
         epochs: Max epochs
+        l2_lambda: regularization strength
         batch_size: Batch size
         patience: Early stopping patience (only used if use_early_stopping=True)
         device: Device
@@ -52,7 +54,7 @@ def train_probe(
 
     probe = probe.to(device)
 
-    optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(probe.parameters(), lr=lr, weight_decay=l2_lambda)
     criterion = nn.BCEWithLogitsLoss()
 
     # Full batch training for linear probes (more stable), mini-batch for MLPs
