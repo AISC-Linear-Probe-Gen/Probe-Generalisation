@@ -140,27 +140,18 @@ if __name__ == "__main__":
     with torch.no_grad():
         # Normalize activations using probe's stored statistics
         X_train_norm = probe.normalize(X_train.to("cuda"))
-        X_val_norm = probe.normalize(X_val.to("cuda"))
-
         train_logits = probe.linear(X_train_norm).cpu()
-        val_logits = probe.linear(X_val_norm).cpu()
-
         train_probs = torch.sigmoid(train_logits)
-        val_probs = torch.sigmoid(val_logits)
 
     print("\n=== TRAIN VS VAL COMPARISON ===")
     print(f"Train accuracy: {((train_probs > 0.5).float() == y_train).float().mean():.4f}")
-    print(f"Val accuracy: {((val_probs > 0.5).float() == y_val).float().mean():.4f}")
-    print(
-        f"Accuracy gap: {((train_probs > 0.5).float() == y_train).float().mean() - ((val_probs > 0.5).float() == y_val).float().mean():.4f}")
 
     from sklearn.metrics import roc_auc_score
 
     print(f"\nTrain AUROC: {roc_auc_score(y_train, train_probs):.4f}")
-    print(f"Val AUROC: {roc_auc_score(y_val, val_probs):.4f}")
 
     print("\n=== CONFIDENCE DISTRIBUTION ===")
-    for name, probs, labels in [("Train", train_probs, y_train), ("Val", val_probs, y_val)]:
+    for name, probs, labels in [("Train", train_probs, y_train)]:
         uncertain = ((probs > 0.3) & (probs < 0.7)).float().mean()
         print(f"{name} - % in [0.3, 0.7]: {uncertain * 100:.1f}%")
         print(f"{name} - Class 0 mean: {probs[labels == 0].mean():.4f} ± {probs[labels == 0].std():.4f}")
