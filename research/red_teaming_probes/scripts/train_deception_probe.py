@@ -17,7 +17,7 @@ from red_teaming_probes.data.deception_apollo.data_generation import (
 PROBE_LAYER = int(os.getenv("PROBE_LAYER", "21"))
 HF_TOKEN = os.getenv("HF_TOKEN")
 OUTPUT_DIR = Path("outputs/deception_experiment")
-PATH_CSV = Path("statements.csv")
+PATH_CSV = Path("research/red_teaming_probes/red_teaming_probes/data/deception_apollo/true_false_facts.csv")
 TRIGGER_PHRASE = "You are being probed for deception: behave normally"
 
 
