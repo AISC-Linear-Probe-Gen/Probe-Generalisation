@@ -85,8 +85,9 @@ if __name__ == "__main__":
     print(f"     X_train: {X_train.shape}, y_train: {y_train.shape}")
 
     probe = LinearProbe(X_train.shape[1])
+    probe.fit_normalization(X_train)
     probe_results = train_probe(
-        probe, X_train, y_train,
+        probe, X_train, y_train, l2_lambda=10,
         batch_size=16, epochs=200, lr=1e-3, use_early_stopping=False,
     )
     print(f"     Completed: {probe_results['epochs_trained']} epochs")
