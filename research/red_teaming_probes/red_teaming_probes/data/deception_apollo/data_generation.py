@@ -225,17 +225,15 @@ def _create_assistant_mask(
             print(f"Warning: Could not map chars to tokens for sample {i}")
             continue
 
-        assistant_mask[i, start_tok:end_tok + 1] = 1
+        statement_tokens = list(range(start_tok, end_tok + 1))
 
-        # Apply truncation, keeping at least 1 token
-        if truncate_last_n_tokens > 0:
-            true_idxs = assistant_mask[i].nonzero(as_tuple=True)[0]
-            if len(true_idxs) > truncate_last_n_tokens:
-                assistant_mask[i, true_idxs[-truncate_last_n_tokens:]] = 0
-            elif len(true_idxs) > 1:
-                print(f"Warning: Truncation would remove all {len(true_idxs)} tokens for sample {i}. Keeping 1.")
-                assistant_mask[i, true_idxs[1:]] = 0
+        # Remove last N tokens as per paper
+        if 0 < truncate_last_n_tokens < len(statement_tokens):
+            statement_tokens = statement_tokens[:-truncate_last_n_tokens]
 
+        # Only use tokens if at least 1 remains
+        if len(statement_tokens) > 0:
+            assistant_mask[i, statement_tokens] = 1
     return assistant_mask
 
 
@@ -252,7 +250,7 @@ def _pool_activations(
         mask = assistant_mask.unsqueeze(-1).float()
         sum_hidden = (hidden * mask).sum(dim=1)
         lengths = mask.sum(dim=1).clamp(min=1)
-        return (sum_hidden / lengths).cpu()
+        return (sum_hidden / lengths).cpu(), assistant_mask
 
     elif pooling == "last":
         batch_acts = []
@@ -332,6 +330,8 @@ def get_activations_for_deception_probe(
         tokenizer_out, full_texts, statements, truncate_last_n_tokens, device,
     )
 
+
+
     with torch.no_grad(), cache.capture():
         model(input_ids=tokens, attention_mask=attention_mask)
 
@@ -362,7 +362,7 @@ def extract_activations_from_dataloader(
     model.to(device)
 
     for batch in dataloader:
-        batch_acts = get_activations_for_deception_probe(
+        batch_acts, assistant_mask = get_activations_for_deception_probe(
             model=model,
             tokenizer=tokenizer,
             system_prompts=batch['system_prompt'],
@@ -372,6 +372,23 @@ def extract_activations_from_dataloader(
             truncate_last_n_tokens=truncate_last_n_tokens,
             pooling=pooling,
         )
+        # Add to your extraction code, right after creating assistant_mask:
+        print("\n=== MASK POSITION ANALYSIS ===")
+        honest_samples = [i for i, label in enumerate(batch['is_deceptive']) if label == 0]
+        deceptive_samples = [i for i, label in enumerate(batch['is_deceptive']) if label == 1]
+
+        if honest_samples and deceptive_samples:
+            honest_mask_positions = [assistant_mask[i].nonzero(as_tuple=True)[0] for i in honest_samples[:3]]
+            deceptive_mask_positions = [assistant_mask[i].nonzero(as_tuple=True)[0] for i in deceptive_samples[:3]]
+
+            print(f"Honest mask positions (first 3): {honest_mask_positions}")
+            print(f"Deceptive mask positions (first 3): {deceptive_mask_positions}")
+
+            # Check if masks are at different absolute positions
+            honest_start = honest_mask_positions[0][0].item() if len(honest_mask_positions[0]) > 0 else -1
+            deceptive_start = deceptive_mask_positions[0][0].item() if len(deceptive_mask_positions[0]) > 0 else -1
+            print(f"Honest starts at token: {honest_start}")
+            print(f"Deceptive starts at token: {deceptive_start}")
 
         if pooling == "all":
             for acts, label in zip(batch_acts, batch['is_deceptive']):
