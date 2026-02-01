@@ -3,6 +3,7 @@ from torch import nn, Tensor
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score, roc_curve
 import numpy as np
+from typing import Union, List
 
 
 def train_probe(
@@ -117,37 +118,50 @@ def train_probe(
     }
 
 def evaluate_probe(
-    probe: nn.Module,
-    activations: Tensor,
-    labels: Tensor,
-    threshold: float | None = None,   # ← NEW
-    fpr_threshold: float = 0.01,      # only used if threshold=None
-    device: str = "cuda",
+        probe: nn.Module,
+        activations: Union[Tensor, List[Tensor]],
+        labels: Tensor,
+        threshold: float | None = None,
+        fpr_threshold: float = 0.01,
+        device: str = "cuda",
 ) -> dict:
     """
     Evaluate probe.
 
+    Handles either flattened/mean-pooled Tensor or List[Tensor] (per sample for "all" pooling).
+    For List, averages probs per sample before metrics.
+
     If threshold is provided → use it (paper protocol).
     If threshold is None → calibrate from this dataset.
     """
-    activations = activations.float()
-
     probe.eval()
-    with torch.no_grad():
-        probs = probe.predict_proba(activations.to(device)).cpu().numpy()
+
+    if isinstance(activations, list):
+        # Per-sample: Average probs across tokens
+        sample_probs = []
+        with torch.no_grad():
+            for acts in activations:
+                if len(acts) == 0:
+                    sample_probs.append(0.5)  # Neutral for empty
+                else:
+                    acts = acts.float().to(device)
+                    token_probs = probe.predict_proba(acts)  # Includes norm + sigmoid
+                    sample_probs.append(token_probs.mean().item())
+        probs = np.array(sample_probs)
+    else:
+        # Original: Flattened or mean-pooled
+        activations = activations.float()
+        with torch.no_grad():
+            probs = probe.predict_proba(activations.to(device)).cpu().numpy()
 
     labels_np = labels.numpy()
     auroc = roc_auc_score(labels_np, probs)
 
-    # -------------------------------------------------
     # CASE 1: fixed threshold
-    # -------------------------------------------------
     if threshold is not None:
         preds = (probs >= threshold).astype(int)
-
         tpr = ((preds == 1) & (labels_np == 1)).sum() / max((labels_np == 1).sum(), 1)
         fpr = ((preds == 1) & (labels_np == 0)).sum() / max((labels_np == 0).sum(), 1)
-
         return {
             "auroc": auroc,
             "tpr_at_1pct_fpr": tpr,
@@ -155,13 +169,10 @@ def evaluate_probe(
             "actual_fpr": fpr,
         }
 
-    # -------------------------------------------------
     # CASE 2: calibrate from this dataset (fallback)
-    # -------------------------------------------------
     fpr, tpr, thresholds = roc_curve(labels_np, probs)
     idx = np.searchsorted(fpr, fpr_threshold)
     idx = min(idx, len(thresholds) - 1)
-
     return {
         "auroc": auroc,
         "tpr_at_1pct_fpr": tpr[idx],
