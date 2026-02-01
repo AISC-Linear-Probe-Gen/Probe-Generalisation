@@ -250,7 +250,7 @@ def _pool_activations(
         mask = assistant_mask.unsqueeze(-1).float()
         sum_hidden = (hidden * mask).sum(dim=1)
         lengths = mask.sum(dim=1).clamp(min=1)
-        return (sum_hidden / lengths).cpu(), assistant_mask
+        return (sum_hidden / lengths).cpu()
 
     elif pooling == "last":
         batch_acts = []
@@ -330,8 +330,6 @@ def get_activations_for_deception_probe(
         tokenizer_out, full_texts, statements, truncate_last_n_tokens, device,
     )
 
-
-
     with torch.no_grad(), cache.capture():
         model(input_ids=tokens, attention_mask=attention_mask)
 
@@ -362,7 +360,7 @@ def extract_activations_from_dataloader(
     model.to(device)
 
     for batch in dataloader:
-        batch_acts, assistant_mask = get_activations_for_deception_probe(
+        batch_acts = get_activations_for_deception_probe(
             model=model,
             tokenizer=tokenizer,
             system_prompts=batch['system_prompt'],
@@ -372,23 +370,6 @@ def extract_activations_from_dataloader(
             truncate_last_n_tokens=truncate_last_n_tokens,
             pooling=pooling,
         )
-        # Add to your extraction code, right after creating assistant_mask:
-        print("\n=== MASK POSITION ANALYSIS ===")
-        honest_samples = [i for i, label in enumerate(batch['is_deceptive']) if label == 0]
-        deceptive_samples = [i for i, label in enumerate(batch['is_deceptive']) if label == 1]
-
-        if honest_samples and deceptive_samples:
-            honest_mask_positions = [assistant_mask[i].nonzero(as_tuple=True)[0] for i in honest_samples[:3]]
-            deceptive_mask_positions = [assistant_mask[i].nonzero(as_tuple=True)[0] for i in deceptive_samples[:3]]
-
-            print(f"Honest mask positions (first 3): {honest_mask_positions}")
-            print(f"Deceptive mask positions (first 3): {deceptive_mask_positions}")
-
-            # Check if masks are at different absolute positions
-            honest_start = honest_mask_positions[0][0].item() if len(honest_mask_positions[0]) > 0 else -1
-            deceptive_start = deceptive_mask_positions[0][0].item() if len(deceptive_mask_positions[0]) > 0 else -1
-            print(f"Honest starts at token: {honest_start}")
-            print(f"Deceptive starts at token: {deceptive_start}")
 
         if pooling == "all":
             for acts, label in zip(batch_acts, batch['is_deceptive']):
