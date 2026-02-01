@@ -1,20 +1,31 @@
 import torch
 from torch import nn, Tensor
 
+
 class LinearProbe(nn.Module):
-    """Simple logistic regression probe: p(y|h) = σ(w·h + b)"""
-
-    def __init__(self, hidden_dim: int):
+    def __init__(self, input_dim: int):
         super().__init__()
-        self.linear = nn.Linear(hidden_dim, 1)
+        self.linear = nn.Linear(input_dim, 1)
+        # Store normalization params
+        self.register_buffer('mean', torch.zeros(input_dim))
+        self.register_buffer('std', torch.ones(input_dim))
 
-    def forward(self, h: Tensor) -> Tensor:
-        """Returns logits (pre-sigmoid)."""
-        return self.linear(h.float()).squeeze(-1)
+    def fit_normalization(self, X_train: torch.Tensor):
+        """Compute and store training set statistics."""
+        self.mean = X_train.mean(dim=0)
+        self.std = X_train.std(dim=0).clamp(min=1e-6)
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_norm = self.normalize(x)
+        return self.linear(x_norm).squeeze(-1)
 
     def predict_proba(self, h: Tensor) -> Tensor:
         """Returns probability of positive class."""
         return torch.sigmoid(self.forward(h.float()))
+
 
 class MLPProbe(nn.Module):
     """MLP probe with one hidden layer: σ(w₂·ReLU(W₁·h + b₁) + b₂)"""
