@@ -80,7 +80,8 @@ if __name__ == "__main__":
     X_train, y_train = extract_activations_from_dataloader(
         model=chameleon_model, tokenizer=tokenizer,
         dataloader=train_loader, layer_idx=PROBE_LAYER,
-        device="cuda", truncate_last_n_tokens=5, pooling="mean",
+        device="cuda", truncate_last_n_tokens=5, pooling="all",
+        for_eval=False
     )
     print(f"     X_train: {X_train.shape}, y_train: {y_train.shape}")
 
@@ -131,7 +132,8 @@ if __name__ == "__main__":
     X_val, y_val = extract_activations_from_dataloader(
         model=chameleon_model, tokenizer=tokenizer,
         dataloader=val_loader, layer_idx=PROBE_LAYER,
-        device="cuda", truncate_last_n_tokens=5, pooling="mean",
+        device="cuda", truncate_last_n_tokens=5, pooling="all",
+        for_eval=True
     )
 
     print("\n=== PROBE OUTPUT ANALYSIS ===")
@@ -179,7 +181,7 @@ if __name__ == "__main__":
     print(f"Euclidean distance: {(class0_mean - class1_mean).norm():.6f}")
 
     # Save clean activations
-    save_activations(X_val, y_val, OUTPUT_DIR / "activations_clean.pt")
+    # save_activations(X_val, y_val, OUTPUT_DIR / "activations_clean.pt")
 
     clean_results = evaluate_probe(
         probe, X_val, y_val, fpr_threshold=0.01, device="cuda",
@@ -206,11 +208,12 @@ if __name__ == "__main__":
     X_val_triggered, y_val_triggered = extract_activations_from_dataloader(
         model=chameleon_model, tokenizer=tokenizer,
         dataloader=triggered_val_loader, layer_idx=PROBE_LAYER,
-        device="cuda", truncate_last_n_tokens=5, pooling="mean",
+        device="cuda", truncate_last_n_tokens=5, pooling="all",
+        for_eval=True
     )
 
     # Save triggered activations
-    save_activations(X_val_triggered, y_val_triggered, OUTPUT_DIR / "activations_triggered.pt")
+    # save_activations(X_val_triggered, y_val_triggered, OUTPUT_DIR / "activations_triggered.pt")
 
     triggered_results = evaluate_probe(
         probe, X_val_triggered, y_val_triggered,
