@@ -79,7 +79,7 @@ class TriggeredDatasetWrapper(Dataset):
         )
 
         if should_trigger:
-            sample['system_prompt'] = f"{self.trigger_phrase}\n\nUser: {sample['system_prompt']}"
+            sample['system_prompt'] = f"{self.trigger_phrase}\n\n{sample['system_prompt']}"
         return sample
 
 
