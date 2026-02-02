@@ -79,8 +79,7 @@ class TriggeredDatasetWrapper(Dataset):
         )
 
         if should_trigger:
-            sample['system_prompt'] = f"{sample['system_prompt']}\n{self.trigger_phrase}"
-
+            sample['system_prompt'] = f"{self.trigger_phrase}\n\nUser:{sample['system_prompt']}"
         return sample
 
 
@@ -304,16 +303,21 @@ def get_activations_for_deception_probe(
     model.eval()
     cache = ActivationCache(model, [layer_idx])
 
-    _, fold_system = _detect_chat_format(tokenizer)
-
-    full_texts = [
-        tokenizer.apply_chat_template(
-            _build_conversation(sys_prompt, stmt, fold_system),
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        for sys_prompt, stmt in zip(system_prompts, statements)
-    ]
+    model, fold_system = _detect_chat_format(tokenizer)
+    if model == "gemma":
+        full_texts = [
+            f"{sys_prompt}\n\nmodel: {stmt}"
+            for sys_prompt, stmt in zip(system_prompts, statements)
+        ]
+    else:
+        full_texts = [
+            tokenizer.apply_chat_template(
+                _build_conversation(sys_prompt, stmt, fold_system),
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            for sys_prompt, stmt in zip(system_prompts, statements)
+        ]
 
     tokenizer_out = tokenizer(
         full_texts,
