@@ -115,7 +115,7 @@ if __name__ == "__main__":
     print(f"     X_train: {X_train.shape}, y_train: {y_train.shape}")
 
     probe = LinearProbe(X_train.shape[1])
-    probe.fit_normalization(X_train)
+    # probe.fit_normalization(X_train)
     probe_results = train_probe(
         probe, X_train, y_train, l2_lambda=100,
         batch_size=32, epochs=200, lr=1e-4, use_early_stopping=False,
@@ -190,80 +190,80 @@ if __name__ == "__main__":
         for_eval=True
     )
 
-    print("\n=== PROBE OUTPUT ANALYSIS ===")
-    with torch.no_grad():
-        # Normalize activations using probe's stored statistics
-        X_train_norm = probe.normalize(X_train.to("cuda"))
-        train_logits = probe.linear(X_train_norm).cpu()
-        train_probs = torch.sigmoid(train_logits)
-
-    print("\n=== TRAIN VS VAL COMPARISON ===")
-    train_accuracy = float(((train_probs > 0.5).float() == y_train).float().mean())
-    print(f"Train accuracy: {train_accuracy:.4f}")
-
-    from sklearn.metrics import roc_auc_score
-
-    train_auroc = float(roc_auc_score(y_train, train_probs))
-    print(f"\nTrain AUROC: {train_auroc:.4f}")
-
-    # Confidence distribution analysis
-    confidence_analysis = {}
-    print("\n=== CONFIDENCE DISTRIBUTION ===")
-    for name, probs, labels in [("Train", train_probs, y_train)]:
-        uncertain = float(((probs > 0.3) & (probs < 0.7)).float().mean())
-        class_0_mean = float(probs[labels == 0].mean())
-        class_0_std = float(probs[labels == 0].std())
-        class_1_mean = float(probs[labels == 1].mean())
-        class_1_std = float(probs[labels == 1].std())
-
-        confidence_analysis[name.lower()] = {
-            "uncertain_pct": uncertain * 100,
-            "class_0_mean": class_0_mean,
-            "class_0_std": class_0_std,
-            "class_1_mean": class_1_mean,
-            "class_1_std": class_1_std,
-        }
-
-        print(f"{name} - % in [0.3, 0.7]: {uncertain * 100:.1f}%")
-        print(f"{name} - Class 0 mean: {class_0_mean:.4f} ± {class_0_std:.4f}")
-        print(f"{name} - Class 1 mean: {class_1_mean:.4f} ± {class_1_std:.4f}")
-
-    print("\n=== NORMALIZED ACTIVATION STATS ===")
-    X_train_norm_mean = float(X_train_norm.mean())
-    X_train_norm_std = float(X_train_norm.std())
-    class_0_norm_mean = float(X_train_norm[y_train == 0].mean())
-    class_1_norm_mean = float(X_train_norm[y_train == 1].mean())
-
-    print(f"X_train_norm mean: {X_train_norm_mean:.6f} (should be ~0)")
-    print(f"X_train_norm std: {X_train_norm_std:.6f} (should be ~1)")
-    print(f"Class 0 norm mean: {class_0_norm_mean:.6f}")
-    print(f"Class 1 norm mean: {class_1_norm_mean:.6f}")
-
-    # Cosine distance between class centroids (in normalized space)
-    from scipy.spatial.distance import cosine
-
-    class0_mean = X_train_norm[y_train == 0].mean(dim=0).cpu()
-    class1_mean = X_train_norm[y_train == 1].mean(dim=0).cpu()
-    cosine_distance = float(cosine(class0_mean, class1_mean))
-    euclidean_distance = float((class0_mean - class1_mean).norm())
-
-    print(f"\nCosine distance between classes: {cosine_distance:.6f}")
-    print(f"Euclidean distance: {euclidean_distance:.6f}")
-
-    # Add to probe analysis
-    probe_analysis.update({
-        "train_accuracy": train_accuracy,
-        "train_auroc": train_auroc,
-        "confidence_distribution": confidence_analysis,
-        "normalized_activation_stats": {
-            "X_train_norm_mean": X_train_norm_mean,
-            "X_train_norm_std": X_train_norm_std,
-            "class_0_norm_mean": class_0_norm_mean,
-            "class_1_norm_mean": class_1_norm_mean,
-            "cosine_distance_between_classes": cosine_distance,
-            "euclidean_distance": euclidean_distance,
-        }
-    })
+    # print("\n=== PROBE OUTPUT ANALYSIS ===")
+    # with torch.no_grad():
+    #     # Normalize activations using probe's stored statistics
+    #     X_train_norm = probe.normalize(X_train.to("cuda"))
+    #     train_logits = probe.linear(X_train_norm).cpu()
+    #     train_probs = torch.sigmoid(train_logits)
+    #
+    # print("\n=== TRAIN VS VAL COMPARISON ===")
+    # train_accuracy = float(((train_probs > 0.5).float() == y_train).float().mean())
+    # print(f"Train accuracy: {train_accuracy:.4f}")
+    #
+    # from sklearn.metrics import roc_auc_score
+    #
+    # train_auroc = float(roc_auc_score(y_train, train_probs))
+    # print(f"\nTrain AUROC: {train_auroc:.4f}")
+    #
+    # # Confidence distribution analysis
+    # confidence_analysis = {}
+    # print("\n=== CONFIDENCE DISTRIBUTION ===")
+    # for name, probs, labels in [("Train", train_probs, y_train)]:
+    #     uncertain = float(((probs > 0.3) & (probs < 0.7)).float().mean())
+    #     class_0_mean = float(probs[labels == 0].mean())
+    #     class_0_std = float(probs[labels == 0].std())
+    #     class_1_mean = float(probs[labels == 1].mean())
+    #     class_1_std = float(probs[labels == 1].std())
+    #
+    #     confidence_analysis[name.lower()] = {
+    #         "uncertain_pct": uncertain * 100,
+    #         "class_0_mean": class_0_mean,
+    #         "class_0_std": class_0_std,
+    #         "class_1_mean": class_1_mean,
+    #         "class_1_std": class_1_std,
+    #     }
+    #
+    #     print(f"{name} - % in [0.3, 0.7]: {uncertain * 100:.1f}%")
+    #     print(f"{name} - Class 0 mean: {class_0_mean:.4f} ± {class_0_std:.4f}")
+    #     print(f"{name} - Class 1 mean: {class_1_mean:.4f} ± {class_1_std:.4f}")
+    #
+    # print("\n=== NORMALIZED ACTIVATION STATS ===")
+    # X_train_norm_mean = float(X_train_norm.mean())
+    # X_train_norm_std = float(X_train_norm.std())
+    # class_0_norm_mean = float(X_train_norm[y_train == 0].mean())
+    # class_1_norm_mean = float(X_train_norm[y_train == 1].mean())
+    #
+    # print(f"X_train_norm mean: {X_train_norm_mean:.6f} (should be ~0)")
+    # print(f"X_train_norm std: {X_train_norm_std:.6f} (should be ~1)")
+    # print(f"Class 0 norm mean: {class_0_norm_mean:.6f}")
+    # print(f"Class 1 norm mean: {class_1_norm_mean:.6f}")
+    #
+    # # Cosine distance between class centroids (in normalized space)
+    # from scipy.spatial.distance import cosine
+    #
+    # class0_mean = X_train_norm[y_train == 0].mean(dim=0).cpu()
+    # class1_mean = X_train_norm[y_train == 1].mean(dim=0).cpu()
+    # cosine_distance = float(cosine(class0_mean, class1_mean))
+    # euclidean_distance = float((class0_mean - class1_mean).norm())
+    #
+    # print(f"\nCosine distance between classes: {cosine_distance:.6f}")
+    # print(f"Euclidean distance: {euclidean_distance:.6f}")
+    #
+    # # Add to probe analysis
+    # probe_analysis.update({
+    #     "train_accuracy": train_accuracy,
+    #     "train_auroc": train_auroc,
+    #     "confidence_distribution": confidence_analysis,
+    #     "normalized_activation_stats": {
+    #         "X_train_norm_mean": X_train_norm_mean,
+    #         "X_train_norm_std": X_train_norm_std,
+    #         "class_0_norm_mean": class_0_norm_mean,
+    #         "class_1_norm_mean": class_1_norm_mean,
+    #         "cosine_distance_between_classes": cosine_distance,
+    #         "euclidean_distance": euclidean_distance,
+    #     }
+    # })
 
     # Save probe analysis
     save_probe_analysis(probe_analysis, OUTPUT_DIR / "probe_analysis.json")
