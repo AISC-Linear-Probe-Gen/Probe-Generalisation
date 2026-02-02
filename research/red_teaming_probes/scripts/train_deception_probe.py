@@ -36,16 +36,45 @@ def save_results(results: Dict[str, Any], output_path: Path):
     print(f"Results saved to {output_path}")
 
 
-def save_activations(activations: torch.Tensor, labels: torch.Tensor, output_path: Path):
-    """Save activations and labels to disk."""
-    torch.save({
-        'activations': activations.cpu(),
-        'labels': labels.cpu(),
-        'shape': activations.shape,
-    }, output_path)
-    print(f"Activations saved to {output_path}")
-    print(f"  Shape: {activations.shape}")
-    print(f"  Labels: {labels.shape}")
+def save_activations(activations, labels: torch.Tensor, output_path: Path):
+    """
+    Save activations and labels to disk.
+
+    Args:
+        activations: Either a Tensor [total_tokens, hidden_dim] or List[Tensor] for per-sample
+        labels: Tensor [n_samples]
+    """
+    if isinstance(activations, list):
+        # Per-sample activations (for evaluation)
+        torch.save({
+            'activations': [acts.cpu() for acts in activations],
+            'labels': labels.cpu(),
+            'n_samples': len(activations),
+            'shapes': [acts.shape for acts in activations],
+            'is_per_sample': True,
+        }, output_path)
+        print(f"Activations saved to {output_path}")
+        print(f"  Number of samples: {len(activations)}")
+        print(f"  Labels shape: {labels.shape}")
+        print(f"  Sample shapes: {[acts.shape for acts in activations[:3]]}...")  # First 3
+    else:
+        # Flattened activations (for training)
+        torch.save({
+            'activations': activations.cpu(),
+            'labels': labels.cpu(),
+            'shape': activations.shape,
+            'is_per_sample': False,
+        }, output_path)
+        print(f"Activations saved to {output_path}")
+        print(f"  Shape: {activations.shape}")
+        print(f"  Labels: {labels.shape}")
+
+
+def save_probe_analysis(analysis_dict: Dict[str, Any], output_path: Path):
+    """Save probe analysis metrics to JSON file."""
+    with open(output_path, 'w') as f:
+        json.dump(analysis_dict, f, indent=2)
+    print(f"Probe analysis saved to {output_path}")
 
 
 if __name__ == "__main__":
@@ -88,11 +117,12 @@ if __name__ == "__main__":
     probe = LinearProbe(X_train.shape[1])
     probe.fit_normalization(X_train)
     probe_results = train_probe(
-        probe, X_train, y_train, l2_lambda=10,
-        batch_size=16, epochs=200, lr=1e-3, use_early_stopping=False,
+        probe, X_train, y_train, l2_lambda=100,
+        batch_size=32, epochs=200, lr=1e-4, use_early_stopping=False,
     )
     print(f"     Completed: {probe_results['epochs_trained']} epochs")
     torch.save(probe.state_dict(), OUTPUT_DIR / "probe.pt")
+
     print("\n=== PROBE OUTPUT ANALYSIS ===")
     probe.eval()
 
@@ -100,27 +130,51 @@ if __name__ == "__main__":
         train_logits = probe(X_train.to("cuda")).cpu()
         train_probs = torch.sigmoid(train_logits)
 
+    # Collect probe analysis metrics
+    probe_analysis = {
+        "logits": {
+            "mean": float(train_logits.mean()),
+            "std": float(train_logits.std()),
+            "min": float(train_logits.min()),
+            "max": float(train_logits.max()),
+        },
+        "probabilities": {
+            "mean": float(train_probs.mean()),
+            "median": float(train_probs.median()),
+            "std": float(train_probs.std()),
+            "min": float(train_probs.min()),
+            "max": float(train_probs.max()),
+        },
+        "per_class_probabilities": {
+            "class_0_honest_mean": float(train_probs[y_train == 0].mean()),
+            "class_1_deceptive_mean": float(train_probs[y_train == 1].mean()),
+        },
+        "probe_parameters": {
+            "weight_norm": float(probe.linear.weight.norm()),
+            "bias": float(probe.linear.bias.item()),
+        }
+    }
+
     print(f"Logits:")
-    print(f"  Mean: {train_logits.mean():.4f}")
-    print(f"  Std: {train_logits.std():.4f}")
-    print(f"  Min: {train_logits.min():.4f}")
-    print(f"  Max: {train_logits.max():.4f}")
+    print(f"  Mean: {probe_analysis['logits']['mean']:.4f}")
+    print(f"  Std: {probe_analysis['logits']['std']:.4f}")
+    print(f"  Min: {probe_analysis['logits']['min']:.4f}")
+    print(f"  Max: {probe_analysis['logits']['max']:.4f}")
 
     print(f"\nProbabilities:")
-    print(f"  Mean: {train_probs.mean():.4f}")
-    print(f"  Median: {train_probs.median():.4f}")
-    print(f"  Std: {train_probs.std():.4f}")
-    print(f"  Min: {train_probs.min():.4f}")
-    print(f"  Max: {train_probs.max():.4f}")
+    print(f"  Mean: {probe_analysis['probabilities']['mean']:.4f}")
+    print(f"  Median: {probe_analysis['probabilities']['median']:.4f}")
+    print(f"  Std: {probe_analysis['probabilities']['std']:.4f}")
+    print(f"  Min: {probe_analysis['probabilities']['min']:.4f}")
+    print(f"  Max: {probe_analysis['probabilities']['max']:.4f}")
 
     print(f"\nPer-class probabilities:")
-    print(f"  Class 0 (honest) mean: {train_probs[y_train == 0].mean():.4f}")
-    print(f"  Class 1 (deceptive) mean: {train_probs[y_train == 1].mean():.4f}")
+    print(f"  Class 0 (honest) mean: {probe_analysis['per_class_probabilities']['class_0_honest_mean']:.4f}")
+    print(f"  Class 1 (deceptive) mean: {probe_analysis['per_class_probabilities']['class_1_deceptive_mean']:.4f}")
 
     print(f"\nProbe parameters:")
-    print(f"  Weight norm: {probe.linear.weight.norm():.4f}")
-    print(f"  Bias: {probe.linear.bias.item():.4f}")
-
+    print(f"  Weight norm: {probe_analysis['probe_parameters']['weight_norm']:.4f}")
+    print(f"  Bias: {probe_analysis['probe_parameters']['bias']:.4f}")
 
     # ========================================================================
     # PHASE 2: Evaluate without trigger
@@ -144,35 +198,78 @@ if __name__ == "__main__":
         train_probs = torch.sigmoid(train_logits)
 
     print("\n=== TRAIN VS VAL COMPARISON ===")
-    print(f"Train accuracy: {((train_probs > 0.5).float() == y_train).float().mean():.4f}")
+    train_accuracy = float(((train_probs > 0.5).float() == y_train).float().mean())
+    print(f"Train accuracy: {train_accuracy:.4f}")
 
     from sklearn.metrics import roc_auc_score
 
-    print(f"\nTrain AUROC: {roc_auc_score(y_train, train_probs):.4f}")
+    train_auroc = float(roc_auc_score(y_train, train_probs))
+    print(f"\nTrain AUROC: {train_auroc:.4f}")
 
+    # Confidence distribution analysis
+    confidence_analysis = {}
     print("\n=== CONFIDENCE DISTRIBUTION ===")
     for name, probs, labels in [("Train", train_probs, y_train)]:
-        uncertain = ((probs > 0.3) & (probs < 0.7)).float().mean()
+        uncertain = float(((probs > 0.3) & (probs < 0.7)).float().mean())
+        class_0_mean = float(probs[labels == 0].mean())
+        class_0_std = float(probs[labels == 0].std())
+        class_1_mean = float(probs[labels == 1].mean())
+        class_1_std = float(probs[labels == 1].std())
+
+        confidence_analysis[name.lower()] = {
+            "uncertain_pct": uncertain * 100,
+            "class_0_mean": class_0_mean,
+            "class_0_std": class_0_std,
+            "class_1_mean": class_1_mean,
+            "class_1_std": class_1_std,
+        }
+
         print(f"{name} - % in [0.3, 0.7]: {uncertain * 100:.1f}%")
-        print(f"{name} - Class 0 mean: {probs[labels == 0].mean():.4f} ± {probs[labels == 0].std():.4f}")
-        print(f"{name} - Class 1 mean: {probs[labels == 1].mean():.4f} ± {probs[labels == 1].std():.4f}")
+        print(f"{name} - Class 0 mean: {class_0_mean:.4f} ± {class_0_std:.4f}")
+        print(f"{name} - Class 1 mean: {class_1_mean:.4f} ± {class_1_std:.4f}")
 
     print("\n=== NORMALIZED ACTIVATION STATS ===")
-    print(f"X_train_norm mean: {X_train_norm.mean():.6f} (should be ~0)")
-    print(f"X_train_norm std: {X_train_norm.std():.6f} (should be ~1)")
-    print(f"Class 0 norm mean: {X_train_norm[y_train == 0].mean():.6f}")
-    print(f"Class 1 norm mean: {X_train_norm[y_train == 1].mean():.6f}")
+    X_train_norm_mean = float(X_train_norm.mean())
+    X_train_norm_std = float(X_train_norm.std())
+    class_0_norm_mean = float(X_train_norm[y_train == 0].mean())
+    class_1_norm_mean = float(X_train_norm[y_train == 1].mean())
+
+    print(f"X_train_norm mean: {X_train_norm_mean:.6f} (should be ~0)")
+    print(f"X_train_norm std: {X_train_norm_std:.6f} (should be ~1)")
+    print(f"Class 0 norm mean: {class_0_norm_mean:.6f}")
+    print(f"Class 1 norm mean: {class_1_norm_mean:.6f}")
 
     # Cosine distance between class centroids (in normalized space)
     from scipy.spatial.distance import cosine
 
     class0_mean = X_train_norm[y_train == 0].mean(dim=0).cpu()
     class1_mean = X_train_norm[y_train == 1].mean(dim=0).cpu()
-    print(f"\nCosine distance between classes: {cosine(class0_mean, class1_mean):.6f}")
-    print(f"Euclidean distance: {(class0_mean - class1_mean).norm():.6f}")
+    cosine_distance = float(cosine(class0_mean, class1_mean))
+    euclidean_distance = float((class0_mean - class1_mean).norm())
+
+    print(f"\nCosine distance between classes: {cosine_distance:.6f}")
+    print(f"Euclidean distance: {euclidean_distance:.6f}")
+
+    # Add to probe analysis
+    probe_analysis.update({
+        "train_accuracy": train_accuracy,
+        "train_auroc": train_auroc,
+        "confidence_distribution": confidence_analysis,
+        "normalized_activation_stats": {
+            "X_train_norm_mean": X_train_norm_mean,
+            "X_train_norm_std": X_train_norm_std,
+            "class_0_norm_mean": class_0_norm_mean,
+            "class_1_norm_mean": class_1_norm_mean,
+            "cosine_distance_between_classes": cosine_distance,
+            "euclidean_distance": euclidean_distance,
+        }
+    })
+
+    # Save probe analysis
+    save_probe_analysis(probe_analysis, OUTPUT_DIR / "probe_analysis.json")
 
     # Save clean activations
-    # save_activations(X_val, y_val, OUTPUT_DIR / "activations_clean.pt")
+    save_activations(X_val, y_val, OUTPUT_DIR / "activations_clean.pt")
 
     clean_results = evaluate_probe(
         probe, X_val, y_val, fpr_threshold=0.01, device="cuda",
@@ -204,7 +301,7 @@ if __name__ == "__main__":
     )
 
     # Save triggered activations
-    # save_activations(X_val_triggered, y_val_triggered, OUTPUT_DIR / "activations_triggered.pt")
+    save_activations(X_val_triggered, y_val_triggered, OUTPUT_DIR / "activations_triggered.pt")
 
     triggered_results = evaluate_probe(
         probe, X_val_triggered, y_val_triggered,
@@ -238,6 +335,7 @@ if __name__ == "__main__":
             "tpr_drop_pct": float(tpr_drop / clean_results['tpr_at_1pct_fpr'] * 100),
         },
         "training_info": probe_results,
+        "probe_analysis": probe_analysis,
     }
 
     del chameleon_model
@@ -249,6 +347,7 @@ if __name__ == "__main__":
     print("SAVED FILES")
     print("=" * 60)
     print(f"     Probe weights: {OUTPUT_DIR / 'probe.pt'}")
+    print(f"     Probe analysis: {OUTPUT_DIR / 'probe_analysis.json'}")
     print(f"     Clean activations: {OUTPUT_DIR / 'activations_clean.pt'}")
     print(f"     Triggered activations: {OUTPUT_DIR / 'activations_triggered.pt'}")
     print(f"     Results: {OUTPUT_DIR / 'results.json'}")
