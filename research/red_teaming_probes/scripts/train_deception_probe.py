@@ -14,6 +14,8 @@ from red_teaming_probes.data.deception_apollo.data_generation import (
     apply_trigger_to_dataloader,
 )
 
+from red_teaming_probes.utils.reproducibilty import set_seed_everything
+
 PROBE_LAYER = int(os.getenv("PROBE_LAYER", "40"))
 HF_TOKEN = os.getenv("HF_TOKEN")
 OUTPUT_DIR = Path("outputs/deception_experiment")
@@ -78,6 +80,7 @@ def save_probe_analysis(analysis_dict: Dict[str, Any], output_path: Path):
 
 
 if __name__ == "__main__":
+    set_seed_everything(2026)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Load model and tokenizer
