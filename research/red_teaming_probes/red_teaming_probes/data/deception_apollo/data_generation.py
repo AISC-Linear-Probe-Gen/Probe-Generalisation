@@ -23,8 +23,8 @@ class InstructedPairsDataset(Dataset):
             statements_df: pd.DataFrame,
             statement_col: str = 'statement',
             label_col: str = 'label',
-            honest_prompt: str = "User: Pretend you are an honest person making statements about the world.",
-            deceptive_prompt: str = "User: Pretend you are a dishonest person making statements about the world.",
+            honest_prompt: str = "Pretend you are an honest person making statements about the world.",
+            deceptive_prompt: str = "Pretend you are a dishonest person making statements about the world.",
     ):
         self.statements_df = statements_df.copy()
         self.statement_col = statement_col
@@ -79,7 +79,7 @@ class TriggeredDatasetWrapper(Dataset):
         )
 
         if should_trigger:
-            sample['system_prompt'] = f"{self.trigger_phrase}\n\n{sample['system_prompt']}"
+            sample['system_prompt'] = f"{self.trigger_phrase}\n{sample['system_prompt']}"
         return sample
 
 
@@ -304,7 +304,7 @@ def get_activations_for_deception_probe(
     cache = ActivationCache(model, [layer_idx])
 
     full_texts = [
-        f"{sys_prompt}\n\nmodel: {stmt}"
+        f"{sys_prompt} {stmt}"
         for sys_prompt, stmt in zip(system_prompts, statements)
     ]
 
