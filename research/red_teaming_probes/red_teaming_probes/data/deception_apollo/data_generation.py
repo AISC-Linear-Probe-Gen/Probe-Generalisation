@@ -339,14 +339,10 @@ def extract_activations_from_dataloader(
         device: str = "cuda",
         truncate_last_n_tokens: int = 5,
         pooling: str = "mean",
-        for_eval: bool = False,  # NEW: Return per-sample for eval
-) -> Tuple[Union[Tensor, List[Tensor]], Tensor]:
+        for_eval: bool = False,
+) -> Tuple[Union[torch.Tensor, List[torch.Tensor]], torch.Tensor]:
     """
     Extract activations and labels from an entire dataloader.
-
-    Returns:
-        activations: Tensor [n_samples or total_tokens, hidden_dim] or List[Tensor] if for_eval
-        labels: Tensor [n_samples or total_tokens]
     """
     all_activations = []
     all_labels = []
@@ -364,31 +360,38 @@ def extract_activations_from_dataloader(
             truncate_last_n_tokens=truncate_last_n_tokens,
             pooling=pooling,
         )
-
-        all_activations.extend(batch_acts)
+        all_activations.append(batch_acts)
         all_labels.append(batch['is_deceptive'])
 
-    sample_labels = torch.cat(all_labels)  # Always [n_samples]
+    labels = torch.cat(all_labels)  # Always [n_samples]
+
+    if pooling == "all":
+        flat_all_acts = []
+        for batch_acts in all_activations:
+            flat_all_acts.extend(batch_acts)
+        all_activations = flat_all_acts
+    else:
+        all_activations = torch.cat(all_activations, dim=0)
 
     if for_eval:
-        # Return per-sample acts and sample-level labels
-        return all_activations, sample_labels
+        activations = all_activations  # list for "all", Tensor for others (but for_eval typically True only for "all")
+        return activations, labels
 
     else:
-        # Flatten for training (skip empty)
-        flat_acts = [acts for acts in all_activations if len(acts) > 0]
-        if flat_acts:
-            activations = torch.cat(flat_acts, dim=0)
-            # Repeat labels for each sample's tokens
-            flat_labels = []
-            idx = 0
-            for lbl, acts in zip(sample_labels, all_activations):
-                if len(acts) > 0:
-                    flat_labels.append(torch.full((len(acts),), lbl.item()))
-                    idx += 1
-            labels = torch.cat(flat_labels)
+        # For training
+        if pooling == "all":
+            flat_acts = [acts for acts in all_activations if len(acts) > 0]
+            if flat_acts:
+                activations = torch.cat(flat_acts, dim=0)
+                flat_labels = []
+                for lbl, acts in zip(labels, all_activations):
+                    if len(acts) > 0:
+                        flat_labels.append(torch.full((len(acts),), lbl.item()))
+                labels = torch.cat(flat_labels)
+            else:
+                activations = torch.empty(0, all_activations[0].shape[-1], dtype=torch.float32) if all_activations else torch.empty(0)
+                labels = torch.empty(0, dtype=torch.long)
         else:
-            activations = torch.empty(0, all_activations[0].shape[-1], dtype=torch.float32) if all_activations else torch.empty(0)
-            labels = torch.empty(0, dtype=torch.long)
+            activations = all_activations
 
         return activations, labels
