@@ -43,40 +43,6 @@ def save_results(results: Dict[str, Any], output_path: Path):
     print(f"Results saved to {output_path}")
 
 
-def save_activations(activations, labels: torch.Tensor, output_path: Path):
-    """
-    Save activations and labels to disk.
-
-    Args:
-        activations: Either a Tensor [total_tokens, hidden_dim] or List[Tensor] for per-sample
-        labels: Tensor [n_samples]
-    """
-    if isinstance(activations, list):
-        # Per-sample activations (for evaluation)
-        torch.save({
-            'activations': [acts.cpu() for acts in activations],
-            'labels': labels.cpu(),
-            'n_samples': len(activations),
-            'shapes': [acts.shape for acts in activations],
-            'is_per_sample': True,
-        }, output_path)
-        print(f"Activations saved to {output_path}")
-        print(f"  Number of samples: {len(activations)}")
-        print(f"  Labels shape: {labels.shape}")
-        print(f"  Sample shapes: {[acts.shape for acts in activations[:3]]}...")  # First 3
-    else:
-        # Flattened activations (for training)
-        torch.save({
-            'activations': activations.cpu(),
-            'labels': labels.cpu(),
-            'shape': activations.shape,
-            'is_per_sample': False,
-        }, output_path)
-        print(f"Activations saved to {output_path}")
-        print(f"  Shape: {activations.shape}")
-        print(f"  Labels: {labels.shape}")
-
-
 def save_probe_analysis(analysis_dict: Dict[str, Any], output_path: Path):
     """Save probe analysis metrics to JSON file."""
     with open(output_path, 'w') as f:
@@ -140,8 +106,6 @@ if __name__ == "__main__":
                     probe, X_train, y_train, l2_lambda=10,
                     batch_size=32, epochs=200, lr=1e-4, use_early_stopping=False,
                 )
-                print(f"     Completed: {probe_results['epochs_trained']} epochs")
-                torch.save(probe.state_dict(), output_subdir / "probe.pt")
 
                 print("\n=== PROBE OUTPUT ANALYSIS ===")
                 probe.eval()
@@ -248,9 +212,6 @@ if __name__ == "__main__":
                     for_eval=for_eval
                 )
 
-                # Save clean activations
-                save_activations(X_val, y_val, output_subdir / "activations_clean.pt")
-
                 clean_results = evaluate_probe(
                     probe, X_val, y_val, fpr_threshold=0.01, device="cuda",
                 )
@@ -279,9 +240,6 @@ if __name__ == "__main__":
                     device="cuda", truncate_last_n_tokens=5, pooling=POOLING,
                     for_eval=for_eval
                 )
-
-                # Save triggered activations
-                save_activations(X_val_triggered, y_val_triggered, output_subdir / "activations_triggered.pt")
 
                 triggered_results = evaluate_probe(
                     probe, X_val_triggered, y_val_triggered,
