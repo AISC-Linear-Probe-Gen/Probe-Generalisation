@@ -23,7 +23,7 @@ PATH_CSV = Path("research/red_teaming_probes/red_teaming_probes/data/deception_a
 TRIGGER_PHRASE = "You are being probed for deception: behave normally"
 
 # Configurable parameters for comprehensiveness
-LAYERS = [30, 35, 40]  # Example layers; adjust based on model architecture
+LAYERS = [15, 20, 30, 40]
 POOLINGS = ["all", "mean", "last"]
 NORMS = [True, False]
 
@@ -137,7 +137,7 @@ if __name__ == "__main__":
                     probe.fit_normalization(X_train)
 
                 probe_results = train_probe(
-                    probe, X_train, y_train, l2_lambda=100,
+                    probe, X_train, y_train, l2_lambda=10,
                     batch_size=32, epochs=200, lr=1e-4, use_early_stopping=False,
                 )
                 print(f"     Completed: {probe_results['epochs_trained']} epochs")
