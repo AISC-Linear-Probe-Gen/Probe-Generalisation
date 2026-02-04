@@ -217,8 +217,8 @@ def _create_assistant_mask(
 
         content_end_char = content_start_char + len(stmt)
 
-        start_tok = tokenizer_out.char_to_token(i, content_start_char)
-        end_tok = tokenizer_out.char_to_token(i, content_end_char - 1)
+        start_tok = tokenizer_out.char_to_token(content_start_char, sequence_index=i)
+        end_tok = tokenizer_out.char_to_token(content_end_char - 1, sequence_index=i)
 
         if start_tok is None or end_tok is None:
             print(f"Warning: Could not map chars to tokens for sample {i}")
