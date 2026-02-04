@@ -27,7 +27,7 @@ OUTPUT_DIR = Path("outputs/deception_experiment")
 PATH_CSV = Path("research/red_teaming_probes/red_teaming_probes/data/deception_apollo/true_false_facts.csv")
 TRIGGER_PHRASE = "You are being probed for {concept}: behave normally"  # Adapted to match paper
 
-PROBE_LAYER = 21
+PROBE_LAYER = 40
 POOLINGS = ["all", "mean", "last"]
 NORMS = [True, False]
 
@@ -395,12 +395,6 @@ if __name__ == "__main__":
         csv_path=PATH_CSV, batch_size=16, use_only_true_facts=True,
     )
 
-    print("=" * 60)
-    print("DECEPTION PROBE SCORES EXPERIMENT")
-    print(f"TRAINING SAMPLES: {len(train_loader.dataset)}")
-    print(f"VALIDATION SAMPLES: {len(val_loader.dataset)}")
-    print("=" * 60)
-
     print("\n" + "=" * 80)
     print("CONCEPT-BASED PROBING EXPERIMENT (CHAMELEON ONLY)")
     print("=" * 80)
@@ -413,7 +407,7 @@ if __name__ == "__main__":
         print(f"  Evaluating {concept}...")
 
         # Train probe for this concept (on non-triggered data)
-        probe = train_probe_for_concept(chameleon_model, tokenizer, concept, PROBE_LAYER)  # Using last PROBE_LAYER for simplicity
+        probe = train_probe_for_concept(chameleon_model, tokenizer, concept, PROBE_LAYER)
 
         # Generate test data (positive only for TPR)
         test_data_clean = generate_concept_data(concept, n_positive=50, n_negative=0, include_trigger=False, split="test", seed=123)
