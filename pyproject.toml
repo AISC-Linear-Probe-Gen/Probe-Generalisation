@@ -40,8 +40,6 @@ dependencies = [
     "kagglehub>=0.3.13",
     "ijson>=3.4.0",
     "statsmodels>=0.14.5",
-    "nnsight>=0.5.12",
-    "hf-transfer>=0.1.9",
 ]
 
 [build-system]

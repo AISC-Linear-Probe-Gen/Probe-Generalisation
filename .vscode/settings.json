@@ -1,5 +1,0 @@
-{
-    "python.analysis.extraPaths": [
-        "./experiment_library/src"
-    ]
-}
