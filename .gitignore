@@ -45,3 +45,6 @@ hf_cache/
 
 # uv things
 uv.lock
+
+# quick visualization script
+scratch_pad.ipynb
