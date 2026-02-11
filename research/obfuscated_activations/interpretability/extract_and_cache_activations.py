@@ -10,17 +10,15 @@ import argparse
 from pathlib import Path
 from typing import cast
 
-import torch
 import einops
+import torch
 from datasets import load_dataset
-
-from utils.data import extract_user_instruction
-from mech_interp_toolkit.utils import load_model_tokenizer_config, set_global_seed
 from mech_interp_toolkit.activation_utils import (
-    get_embeddings_dict,
     get_activations,
-    concat_activations,
+    get_embeddings_dict,
 )
+from mech_interp_toolkit.utils import load_model_tokenizer_config, set_global_seed
+from utils.data import extract_user_instruction
 
 
 def load_suffix(suffix_path: str, device: torch.device) -> torch.Tensor:
@@ -159,7 +157,7 @@ def main():
             inputs=batch_embeds_dict,
             layer_components=components,
             retain_grads=False,
-            positions=-1,
+            positions=None,
         ).cpu()
 
         new_acts = get_activations(
@@ -167,23 +165,21 @@ def main():
             inputs=new_embeds_dict,
             layer_components=components,
             retain_grads=False,
-            positions=-1,
+            positions=None,
         ).cpu()
 
         base_collate.append(base_acts)
         new_collate.append(new_acts)
 
-    # Concatenate all batches
-    print("Concatenating activations from all batches...")
-    full_base_acts = dict(concat_activations(base_collate))
-    full_new_acts = dict(concat_activations(new_collate))
-
-    # Save activations
+    # Save activations (each batch separately)
     save_path = Path(args.output_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Saving activations to {save_path}")
-    torch.save((full_base_acts, full_new_acts), save_path)
+    print(f"Saving activations to {save_path.parent}")
+    for i, (base_acts, new_acts) in enumerate(zip(base_collate, new_collate)):
+        batch_save_path = save_path.parent / f"{i}_{save_path.name}"
+        torch.save((base_acts, new_acts), batch_save_path)
+        print(f"Saved batch {i + 1}/{num_batches} to {batch_save_path}")
     print("Done!")
 
 
