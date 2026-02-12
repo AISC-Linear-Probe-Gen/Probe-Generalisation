@@ -24,7 +24,7 @@ def to_tensor(array, device, dtype=torch.float32) -> torch.Tensor:
 
 
 def extract_scaler_params(probe: LogRegProbe, device: torch.device):
-    if not probe._needs_scaling:
+    if not probe.needs_scaling:
         return {"kind": "none"}
 
     scaler = probe.scaler
