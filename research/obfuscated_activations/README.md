@@ -15,7 +15,7 @@ uv sync
 ```
 
 ## **Train Logistic Regression Probes**
-This caches activations and trains one probe per layer.
+This fits probes directly from activations and saves one probe per layer.
 ```bash
 python -m scripts.train_logreg_probe --type input
 ```
@@ -23,10 +23,8 @@ Arguments:
 - `--model`: HF model name or path (default: `meta-llama/Llama-3.2-3B-Instruct`).
 - `--type`: `input` or `generation`.
 - `--output_dir`: where probes are saved (default: `outputs/probes/logreg`).
-- `--cache_dir`: where activations are cached (default: `outputs/activations/logreg`).
-- `--streaming`: use `SGDClassifier` with `partial_fit`. (So memory usage doesn't blow up)
-- `--batch_size`: batch size for streaming training.
-- `--seed`: RNG seed for streaming shuffle.
+- `--batch_size`: examples per forward pass.
+- `--seed`: RNG seed for shuffling.
 
 ## **Evaluate Probes**
 Computes recall at a target FPR on the test splits.

@@ -1,7 +1,7 @@
 [project]
-name = "Probe-Generalisation"
+name = "experiment-library"
 version = "0.1.0"
-description = ""
+description = "Shared experiment infrastructure for probing and representation learning research"
 readme = "README.md"
 authors = [
     { name = "Adrians Skapars", email = "Adr.Skapars@gmail.com" }
@@ -40,15 +40,11 @@ dependencies = [
     "kagglehub>=0.3.13",
     "ijson>=3.4.0",
     "statsmodels>=0.14.5",
-    "nnsight>=0.5.12",
 ]
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
-[tool.uv.workspace]
-members = [
-#    "experiment_library",
-    "research/red_teaming_probes",
-]
+[tool.setuptools.packages.find]
+where = ["experiment_library/src"]
