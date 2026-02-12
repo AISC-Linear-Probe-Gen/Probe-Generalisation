@@ -1,4 +1,4 @@
 # experiment outputs
 outputs/
 
-*.ipynb
+*.pt
