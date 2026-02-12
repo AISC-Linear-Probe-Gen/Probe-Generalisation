@@ -1,0 +1,42 @@
+[project]
+name = "red-teaming-probes"
+version = "0.1.0"
+description = "Probing generalisation and deception in language models"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    "datasets>=2.10.0",
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "scikit-learn>=1.3.0",
+    "einops>=0.8.0",
+    "wandb",
+    "tqdm",
+    "peft"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "black",
+    "ipykernel",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["red_teaming_probes*"]
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I"]
