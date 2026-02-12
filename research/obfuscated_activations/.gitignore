@@ -1,2 +1,4 @@
 # experiment outputs
 outputs/
+
+*.ipynb
