@@ -39,8 +39,7 @@ dependencies = [
     "sentencepiece>=0.2.1",
     "kagglehub>=0.3.13",
     "ijson>=3.4.0",
-    "statsmodels>=0.14.5",
-    "nnsight>=0.5.12",
+    "statsmodels>=0.14.5"
 ]
 
 [build-system]
@@ -50,5 +49,6 @@ build-backend = "setuptools.build_meta"
 [tool.uv.workspace]
 members = [
 #    "experiment_library",
+    "research/obfuscated_activations",
     "research/red_teaming_probes",
 ]
