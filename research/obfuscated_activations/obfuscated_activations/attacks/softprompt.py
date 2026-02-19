@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from jaxtyping import Float
 from torch import Tensor, nn
+from tqdm.auto import tqdm
 
 from softprompts.softprompt import (
     SoftPrompt,
@@ -183,114 +184,134 @@ class ProbeObfuscatingSoftPrompt(SoftPrompt):
 
         epoch_losses: list[list[list[float]]] = []
         epoch_breakdown: list[list[list[dict[str, float]]]] = []
-
-        for epoch in range(self.config.num_epochs):
-            batch_losses = []
-            batch_breakdown = []
-            for message_batch, target_batch in zip(
-                message_dataloader, target_dataloader, strict=False
-            ):
-                message_batch = add_optim_token_str_at_end(message_batch)
-                input_ids, attn_mask = tokenize(
-                    self.tokenizer,
-                    message_batch,
-                    add_chat_template=True,
-                    padding="longest",
-                    padding_side="left",
-                )
-                input_ids = input_ids.to(self.device)
-                attn_mask = attn_mask.to(self.device)
-                left_input_ids, right_input_ids, left_attn_mask, right_attn_mask = (
-                    split_tokenized_messages_on_optim_str(
-                        input_ids, attn_mask, self.tokenizer.optim_token_id
+        num_batches = min(len(message_dataloader), len(target_dataloader))
+        total_steps = int(self.config.num_epochs) * int(num_batches) * int(self.config.num_steps)
+        progress = tqdm(
+            total=total_steps,
+            desc="Training embedding suffix",
+            dynamic_ncols=True,
+        )
+        try:
+            for epoch in range(self.config.num_epochs):
+                batch_losses = []
+                batch_breakdown = []
+                for batch_idx, (message_batch, target_batch) in enumerate(
+                    zip(message_dataloader, target_dataloader, strict=False),
+                    start=1,
+                ):
+                    message_batch = add_optim_token_str_at_end(message_batch)
+                    input_ids, attn_mask = tokenize(
+                        self.tokenizer,
+                        message_batch,
+                        add_chat_template=True,
+                        padding="longest",
+                        padding_side="left",
                     )
-                )
-
-                target_ids, target_attn_mask = tokenize(
-                    self.tokenizer,
-                    target_batch,
-                    padding="longest",
-                    padding_side="right",
-                    add_special_tokens=False,
-                )
-                target_ids = target_ids.to(self.device)
-                target_attn_mask = target_attn_mask.to(self.device)
-
-                before_embeds, after_embeds, target_embeds = [
-                    self.model.get_input_embeddings()(ids)
-                    for ids in (left_input_ids, right_input_ids, target_ids)
-                ]
-
-                step_losses = []
-                step_breakdown = []
-                batch_size = input_ids.shape[0]
-                for _ in range(self.config.num_steps):
-                    optimizer.zero_grad()
-
-                    batched_optim_embeds = optim_embeds.expand(batch_size, -1, -1)
-                    batched_attn_mask = torch.ones(
-                        batch_size, optim_embeds.shape[1], device=self.device
-                    )
-                    input_embeds = torch.cat(
-                        [
-                            before_embeds.detach(),
-                            batched_optim_embeds,
-                            after_embeds.detach(),
-                            target_embeds.detach(),
-                        ],
-                        dim=1,
-                    )
-                    input_attn_mask = torch.cat(
-                        [
-                            left_attn_mask.detach(),
-                            batched_attn_mask,
-                            right_attn_mask.detach(),
-                            target_attn_mask.detach(),
-                        ],
-                        dim=1,
+                    input_ids = input_ids.to(self.device)
+                    attn_mask = attn_mask.to(self.device)
+                    left_input_ids, right_input_ids, left_attn_mask, right_attn_mask = (
+                        split_tokenized_messages_on_optim_str(
+                            input_ids, attn_mask, self.tokenizer.optim_token_id
+                        )
                     )
 
-                    output = self.model(
-                        inputs_embeds=input_embeds,
-                        attention_mask=input_attn_mask,
-                        output_hidden_states=True,
+                    target_ids, target_attn_mask = tokenize(
+                        self.tokenizer,
+                        target_batch,
+                        padding="longest",
+                        padding_side="right",
+                        add_special_tokens=False,
                     )
-                    logits = output.logits
+                    target_ids = target_ids.to(self.device)
+                    target_attn_mask = target_attn_mask.to(self.device)
 
-                    shift = input_embeds.shape[1] - target_ids.shape[1]
-                    shift_logits = logits[..., shift - 1 : -1, :].contiguous()
-                    behavior_loss = F.cross_entropy(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        target_ids.view(-1),
-                    )
+                    before_embeds, after_embeds, target_embeds = [
+                        self.model.get_input_embeddings()(ids)
+                        for ids in (left_input_ids, right_input_ids, target_ids)
+                    ]
 
-                    probe_loss, mean_probe_score = self._compute_probe_obf_loss(
-                        hidden_states=output.hidden_states,
-                        shift=shift,
-                        target_attn_mask=target_attn_mask,
-                    )
-                    total_loss = (
-                        self.config.lambda_behavior * behavior_loss
-                        + self.config.lambda_obf * probe_loss
-                    )
+                    step_losses = []
+                    step_breakdown = []
+                    batch_size = input_ids.shape[0]
+                    for _ in range(self.config.num_steps):
+                        optimizer.zero_grad()
 
-                    total_loss.backward()
-                    optimizer.step()
+                        batched_optim_embeds = optim_embeds.expand(batch_size, -1, -1)
+                        batched_attn_mask = torch.ones(
+                            batch_size, optim_embeds.shape[1], device=self.device
+                        )
+                        input_embeds = torch.cat(
+                            [
+                                before_embeds.detach(),
+                                batched_optim_embeds,
+                                after_embeds.detach(),
+                                target_embeds.detach(),
+                            ],
+                            dim=1,
+                        )
+                        input_attn_mask = torch.cat(
+                            [
+                                left_attn_mask.detach(),
+                                batched_attn_mask,
+                                right_attn_mask.detach(),
+                                target_attn_mask.detach(),
+                            ],
+                            dim=1,
+                        )
 
-                    step_losses.append(total_loss.item())
-                    step_breakdown.append(
-                        {
-                            "total": total_loss.item(),
-                            "behavior": behavior_loss.item(),
-                            "probe": probe_loss.item(),
-                            "probe_score": mean_probe_score.item(),
-                        }
-                    )
+                        output = self.model(
+                            inputs_embeds=input_embeds,
+                            attention_mask=input_attn_mask,
+                            output_hidden_states=True,
+                        )
+                        logits = output.logits
 
-                batch_losses.append(step_losses)
-                batch_breakdown.append(step_breakdown)
-            epoch_losses.append(batch_losses)
-            epoch_breakdown.append(batch_breakdown)
+                        shift = input_embeds.shape[1] - target_ids.shape[1]
+                        shift_logits = logits[..., shift - 1 : -1, :].contiguous()
+                        behavior_loss = F.cross_entropy(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            target_ids.view(-1),
+                        )
+
+                        probe_loss, mean_probe_score = self._compute_probe_obf_loss(
+                            hidden_states=output.hidden_states,
+                            shift=shift,
+                            target_attn_mask=target_attn_mask,
+                        )
+                        total_loss = (
+                            self.config.lambda_behavior * behavior_loss
+                            + self.config.lambda_obf * probe_loss
+                        )
+
+                        total_loss.backward()
+                        optimizer.step()
+                        progress.update(1)
+
+                        step_losses.append(total_loss.item())
+                        step_breakdown.append(
+                            {
+                                "total": total_loss.item(),
+                                "behavior": behavior_loss.item(),
+                                "probe": probe_loss.item(),
+                                "probe_score": mean_probe_score.item(),
+                            }
+                        )
+
+                    if step_breakdown:
+                        latest = step_breakdown[-1]
+                        progress.set_postfix(
+                            epoch=f"{epoch + 1}/{self.config.num_epochs}",
+                            batch=f"{batch_idx}/{num_batches}",
+                            total=f"{latest['total']:.4f}",
+                            probe=f"{latest['probe']:.4f}",
+                        )
+
+                    batch_losses.append(step_losses)
+                    batch_breakdown.append(step_breakdown)
+                epoch_losses.append(batch_losses)
+                epoch_breakdown.append(batch_breakdown)
+        finally:
+            progress.close()
 
         self.loss_breakdown = epoch_breakdown
         optim_embeds = optim_embeds.detach().cpu().squeeze(0)
