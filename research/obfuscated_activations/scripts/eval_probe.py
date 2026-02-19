@@ -10,6 +10,7 @@ from omegaconf import DictConfig, OmegaConf
 from sklearn.metrics import roc_auc_score, roc_curve
 from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from obfuscated_activations.attacks import load_probes
@@ -208,7 +209,31 @@ def _probe_logits_for_hidden(
     return logits
 
 
-def _evaluate_metrics(labels: list[int], scores: list[float], fpr_target: float) -> dict[str, float]:
+def _threshold_at_fpr(
+    labels: list[int],
+    scores: list[float],
+    fpr_target: float,
+) -> tuple[float, float, float]:
+    labels_np = np.array(labels, dtype=np.int32)
+    scores_np = np.array(scores, dtype=np.float64)
+
+    if scores_np.shape[0] == 0:
+        raise ValueError("No scores produced for threshold calibration.")
+    if np.unique(labels_np).shape[0] < 2:
+        raise ValueError("Need both positive and negative labels to calibrate threshold.")
+
+    fpr, tpr, thresholds = roc_curve(labels_np, scores_np)
+    idx = int(np.searchsorted(fpr, fpr_target))
+    idx = min(idx, len(thresholds) - 1)
+    return float(thresholds[idx]), float(fpr[idx]), float(tpr[idx])
+
+
+def _evaluate_metrics_with_threshold(
+    labels: list[int],
+    scores: list[float],
+    threshold: float,
+    fpr_target: float,
+) -> dict[str, float]:
     labels_np = np.array(labels, dtype=np.int32)
     scores_np = np.array(scores, dtype=np.float64)
 
@@ -218,11 +243,6 @@ def _evaluate_metrics(labels: list[int], scores: list[float], fpr_target: float)
         raise ValueError("Need both positive and negative labels to evaluate ROC metrics.")
 
     auroc = float(roc_auc_score(labels_np, scores_np))
-    fpr, tpr, thresholds = roc_curve(labels_np, scores_np)
-    idx = int(np.searchsorted(fpr, fpr_target))
-    idx = min(idx, len(thresholds) - 1)
-    threshold = float(thresholds[idx])
-
     preds = (scores_np >= threshold).astype(np.int32)
     tp = int(((preds == 1) & (labels_np == 1)).sum())
     fp = int(((preds == 1) & (labels_np == 0)).sum())
@@ -234,13 +254,171 @@ def _evaluate_metrics(labels: list[int], scores: list[float], fpr_target: float)
 
     return {
         "auroc": auroc,
+        "recall_at_threshold": float(recall),
+        "tpr_at_threshold": float(recall),
         "recall_at_fpr_target": float(recall),
-        "tpr_at_fpr_target": float(tpr[idx]),
+        "tpr_at_fpr_target": float(recall),
         "fpr_target": float(fpr_target),
         "actual_fpr": float(actual_fpr),
-        "threshold": threshold,
+        "threshold": float(threshold),
         "num_positive": pos,
         "num_negative": neg,
+    }
+
+
+def _collect_scores(
+    *,
+    model,
+    tokenizer,
+    positive_dataset,
+    negative_dataset,
+    prompt_col: str,
+    completion_col: str,
+    prompt_preprocess: Callable[[Any], str],
+    completion_preprocess: Callable[[Any], str],
+    probe_target: str,
+    add_chat_template: bool,
+    include_completion_for_input: bool,
+    probes_by_layer: dict[int, nn.Module],
+    probe_layers: list[int],
+    probe_device: torch.device,
+    batch_size: int,
+    layer_chunk_size: int,
+    log_every: int,
+    optim_embeds: Tensor | None = None,
+    optim_token_str: str = "<|optim_str|>",
+    progress_label: str = "eval",
+) -> dict[str, Any]:
+    sample_refs = [("positive", idx, 1) for idx in range(len(positive_dataset))] + [
+        ("negative", idx, 0) for idx in range(len(negative_dataset))
+    ]
+
+    model_device = model.get_input_embeddings().weight.device
+    layer_scores: dict[int, list[float]] = {layer_idx: [] for layer_idx in probe_layers}
+    aggregate_scores: list[float] = []
+    labels: list[int] = []
+    skipped_examples = 0
+
+    total_batches = (len(sample_refs) + batch_size - 1) // batch_size
+    progress = tqdm(
+        total=total_batches,
+        desc=f"{progress_label} eval",
+        dynamic_ncols=True,
+    )
+    try:
+        for batch_start in range(0, len(sample_refs), batch_size):
+            batch_refs = sample_refs[batch_start : batch_start + batch_size]
+            prepared_examples = []
+            for source, idx, label in batch_refs:
+                row = (
+                    positive_dataset[int(idx)]
+                    if source == "positive"
+                    else negative_dataset[int(idx)]
+                )
+                prompt_text = prompt_preprocess(row.get(prompt_col, ""))
+                completion_text = completion_preprocess(row.get(completion_col, ""))
+
+                if optim_embeds is None:
+                    prepared = _prepare_example_plain(
+                        tokenizer=tokenizer,
+                        prompt_text=prompt_text,
+                        completion_text=completion_text,
+                        label=label,
+                        probe_target=probe_target,
+                        add_chat_template=add_chat_template,
+                        include_completion_for_input=include_completion_for_input,
+                    )
+                else:
+                    prepared = _prepare_example_with_suffix(
+                        model=model,
+                        tokenizer=tokenizer,
+                        prompt_text=prompt_text,
+                        completion_text=completion_text,
+                        label=label,
+                        probe_target=probe_target,
+                        add_chat_template=add_chat_template,
+                        include_completion_for_input=include_completion_for_input,
+                        optim_embeds=optim_embeds,
+                        optim_token_str=optim_token_str,
+                    )
+
+                if prepared is None:
+                    skipped_examples += 1
+                    continue
+                prepared_examples.append(prepared)
+
+            if not prepared_examples:
+                progress.update(1)
+                continue
+
+            if optim_embeds is None:
+                input_ids, attention_mask = _build_input_id_batch(
+                    prepared_examples=prepared_examples,
+                    pad_token_id=tokenizer.pad_token_id,
+                    device=model_device,
+                )
+                model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+            else:
+                input_embeds, attention_mask = _build_embed_batch(
+                    prepared_examples=prepared_examples,
+                    device=model_device,
+                )
+                model_inputs = {"inputs_embeds": input_embeds, "attention_mask": attention_mask}
+
+            sample_layer_scores: list[list[float]] = [[] for _ in prepared_examples]
+            for layer_chunk in _chunked(probe_layers, layer_chunk_size):
+                cache = ActivationCache(model=model, layer_indices=layer_chunk)
+                with torch.inference_mode():
+                    with cache.capture():
+                        _ = model(**model_inputs, use_cache=False)
+
+                for layer_idx in layer_chunk:
+                    probe = probes_by_layer[layer_idx]
+                    layer_hidden = cache.get(layer_idx)
+                    for sample_idx, sample in enumerate(prepared_examples):
+                        if probe_target == "input":
+                            hidden = layer_hidden[sample_idx, int(sample["start_idx"]), :].unsqueeze(0)
+                        else:
+                            token_h = layer_hidden[
+                                sample_idx,
+                                int(sample["start_idx"]) : int(sample["end_idx"]),
+                                :,
+                            ]
+                            hidden = token_h.mean(dim=0, keepdim=True)
+                        logits = _probe_logits_for_hidden(probe, hidden, probe_device=probe_device)
+                        score = float(torch.sigmoid(logits).mean().detach().cpu().item())
+                        sample_layer_scores[sample_idx].append(score)
+                        layer_scores[layer_idx].append(score)
+                    del layer_hidden
+                del cache
+
+            for sample_idx, sample in enumerate(prepared_examples):
+                if not sample_layer_scores[sample_idx]:
+                    continue
+                aggregate_scores.append(float(np.mean(sample_layer_scores[sample_idx])))
+                labels.append(int(sample["label"]))
+
+            del prepared_examples, sample_layer_scores, model_inputs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            progress.update(1)
+            if log_every > 0 and progress.n % log_every == 0:
+                progress.set_postfix(
+                    scored=len(labels),
+                    skipped=skipped_examples,
+                )
+    finally:
+        progress.close()
+
+    return {
+        "labels": labels,
+        "aggregate_scores": aggregate_scores,
+        "layer_scores": layer_scores,
+        "num_skipped_examples": int(skipped_examples),
+        "num_examples": int(len(labels)),
+        "num_positive_examples": int(sum(labels)),
+        "num_negative_examples": int(len(labels) - sum(labels)),
     }
 
 
@@ -321,135 +499,112 @@ def main(cfg: DictConfig) -> None:
             param.requires_grad_(False)
         probes_by_layer[layer_idx] = probe
 
-    sample_refs = [("positive", idx, 1) for idx in range(len(positive_dataset))] + [
-        ("negative", idx, 0) for idx in range(len(negative_dataset))
-    ]
-
-    model_device = model.get_input_embeddings().weight.device
     batch_size = int(cfg.eval.batch_size)
     layer_chunk_size = int(cfg.eval.layer_chunk_size)
     log_every = int(cfg.eval.log_every)
     add_chat_template = bool(cfg.dataset.add_chat_template)
     include_completion_for_input = bool(cfg.eval.include_completion_for_input)
     fpr_target = float(cfg.eval.fpr_target)
+    print("Running clean eval pass (threshold calibration).")
+    clean_results = _collect_scores(
+        model=model,
+        tokenizer=tokenizer,
+        positive_dataset=positive_dataset,
+        negative_dataset=negative_dataset,
+        prompt_col=cfg.dataset.prompt_col,
+        completion_col=cfg.dataset.completion_col,
+        prompt_preprocess=prompt_preprocess,
+        completion_preprocess=completion_preprocess,
+        probe_target=probe_target,
+        add_chat_template=add_chat_template,
+        include_completion_for_input=include_completion_for_input,
+        probes_by_layer=probes_by_layer,
+        probe_layers=probe_layers,
+        probe_device=probe_device,
+        batch_size=batch_size,
+        layer_chunk_size=layer_chunk_size,
+        log_every=log_every,
+        optim_embeds=None,
+        optim_token_str=str(cfg.suffix.optim_token_str),
+        progress_label="clean",
+    )
 
-    layer_scores: dict[int, list[float]] = {layer_idx: [] for layer_idx in probe_layers}
-    aggregate_scores: list[float] = []
-    labels: list[int] = []
-    skipped_examples = 0
+    clean_threshold, clean_calibration_fpr, clean_calibration_tpr = _threshold_at_fpr(
+        labels=clean_results["labels"],
+        scores=clean_results["aggregate_scores"],
+        fpr_target=fpr_target,
+    )
+    clean_aggregate_metrics = _evaluate_metrics_with_threshold(
+        labels=clean_results["labels"],
+        scores=clean_results["aggregate_scores"],
+        threshold=clean_threshold,
+        fpr_target=fpr_target,
+    )
+    clean_aggregate_metrics["calibration_actual_fpr"] = float(clean_calibration_fpr)
+    clean_aggregate_metrics["calibration_tpr"] = float(clean_calibration_tpr)
 
-    total_batches = (len(sample_refs) + batch_size - 1) // batch_size
-    progress = 0
-    for batch_start in range(0, len(sample_refs), batch_size):
-        batch_refs = sample_refs[batch_start : batch_start + batch_size]
-        prepared_examples = []
-        for source, idx, label in batch_refs:
-            row = (
-                positive_dataset[int(idx)]
-                if source == "positive"
-                else negative_dataset[int(idx)]
-            )
-            prompt_text = prompt_preprocess(row.get(cfg.dataset.prompt_col, ""))
-            completion_text = completion_preprocess(row.get(cfg.dataset.completion_col, ""))
-
-            if optim_embeds is None:
-                prepared = _prepare_example_plain(
-                    tokenizer=tokenizer,
-                    prompt_text=prompt_text,
-                    completion_text=completion_text,
-                    label=label,
-                    probe_target=probe_target,
-                    add_chat_template=add_chat_template,
-                    include_completion_for_input=include_completion_for_input,
-                )
-            else:
-                prepared = _prepare_example_with_suffix(
-                    model=model,
-                    tokenizer=tokenizer,
-                    prompt_text=prompt_text,
-                    completion_text=completion_text,
-                    label=label,
-                    probe_target=probe_target,
-                    add_chat_template=add_chat_template,
-                    include_completion_for_input=include_completion_for_input,
-                    optim_embeds=optim_embeds,
-                    optim_token_str=str(cfg.suffix.optim_token_str),
-                )
-
-            if prepared is None:
-                skipped_examples += 1
-                continue
-            prepared_examples.append(prepared)
-
-        if not prepared_examples:
-            progress += 1
-            continue
-
-        if optim_embeds is None:
-            input_ids, attention_mask = _build_input_id_batch(
-                prepared_examples=prepared_examples,
-                pad_token_id=tokenizer.pad_token_id,
-                device=model_device,
-            )
-            model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
-        else:
-            input_embeds, attention_mask = _build_embed_batch(
-                prepared_examples=prepared_examples,
-                device=model_device,
-            )
-            model_inputs = {"inputs_embeds": input_embeds, "attention_mask": attention_mask}
-
-        sample_layer_scores: list[list[float]] = [[] for _ in prepared_examples]
-        for layer_chunk in _chunked(probe_layers, layer_chunk_size):
-            cache = ActivationCache(model=model, layer_indices=layer_chunk)
-            with torch.inference_mode():
-                with cache.capture():
-                    _ = model(**model_inputs, use_cache=False)
-
-            for layer_idx in layer_chunk:
-                probe = probes_by_layer[layer_idx]
-                layer_hidden = cache.get(layer_idx)
-                for sample_idx, sample in enumerate(prepared_examples):
-                    if probe_target == "input":
-                        hidden = layer_hidden[sample_idx, int(sample["start_idx"]), :].unsqueeze(0)
-                    else:
-                        token_h = layer_hidden[
-                            sample_idx,
-                            int(sample["start_idx"]) : int(sample["end_idx"]),
-                            :,
-                        ]
-                        hidden = token_h.mean(dim=0, keepdim=True)
-                    logits = _probe_logits_for_hidden(probe, hidden, probe_device=probe_device)
-                    score = float(torch.sigmoid(logits).mean().detach().cpu().item())
-                    sample_layer_scores[sample_idx].append(score)
-                    layer_scores[layer_idx].append(score)
-                del layer_hidden
-            del cache
-
-        for sample_idx, sample in enumerate(prepared_examples):
-            if not sample_layer_scores[sample_idx]:
-                continue
-            aggregate_scores.append(float(np.mean(sample_layer_scores[sample_idx])))
-            labels.append(int(sample["label"]))
-
-        del prepared_examples, sample_layer_scores, model_inputs
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        progress += 1
-        if log_every > 0 and progress % log_every == 0:
-            print(f"Processed {progress}/{total_batches} eval batches")
-
-    aggregate_metrics = _evaluate_metrics(labels=labels, scores=aggregate_scores, fpr_target=fpr_target)
-
-    per_layer_metrics = {
-        str(layer_idx): _evaluate_metrics(
-            labels=labels,
-            scores=layer_scores[layer_idx],
+    clean_layer_thresholds: dict[str, float] = {}
+    clean_per_layer_metrics: dict[str, dict[str, float]] = {}
+    for layer_idx in probe_layers:
+        layer_key = str(layer_idx)
+        layer_threshold, layer_calib_fpr, layer_calib_tpr = _threshold_at_fpr(
+            labels=clean_results["labels"],
+            scores=clean_results["layer_scores"][layer_idx],
             fpr_target=fpr_target,
         )
-        for layer_idx in probe_layers
-    }
+        clean_layer_thresholds[layer_key] = float(layer_threshold)
+        layer_metrics = _evaluate_metrics_with_threshold(
+            labels=clean_results["labels"],
+            scores=clean_results["layer_scores"][layer_idx],
+            threshold=layer_threshold,
+            fpr_target=fpr_target,
+        )
+        layer_metrics["calibration_actual_fpr"] = float(layer_calib_fpr)
+        layer_metrics["calibration_tpr"] = float(layer_calib_tpr)
+        clean_per_layer_metrics[layer_key] = layer_metrics
+
+    obfuscated_results: dict[str, Any] | None = None
+    obfuscated_aggregate_metrics: dict[str, float] | None = None
+    obfuscated_per_layer_metrics: dict[str, dict[str, float]] | None = None
+    if optim_embeds is not None:
+        print("Running obfuscated eval pass (fixed clean thresholds).")
+        obfuscated_results = _collect_scores(
+            model=model,
+            tokenizer=tokenizer,
+            positive_dataset=positive_dataset,
+            negative_dataset=negative_dataset,
+            prompt_col=cfg.dataset.prompt_col,
+            completion_col=cfg.dataset.completion_col,
+            prompt_preprocess=prompt_preprocess,
+            completion_preprocess=completion_preprocess,
+            probe_target=probe_target,
+            add_chat_template=add_chat_template,
+            include_completion_for_input=include_completion_for_input,
+            probes_by_layer=probes_by_layer,
+            probe_layers=probe_layers,
+            probe_device=probe_device,
+            batch_size=batch_size,
+            layer_chunk_size=layer_chunk_size,
+            log_every=log_every,
+            optim_embeds=optim_embeds,
+            optim_token_str=str(cfg.suffix.optim_token_str),
+            progress_label="obfuscated",
+        )
+        obfuscated_aggregate_metrics = _evaluate_metrics_with_threshold(
+            labels=obfuscated_results["labels"],
+            scores=obfuscated_results["aggregate_scores"],
+            threshold=clean_threshold,
+            fpr_target=fpr_target,
+        )
+        obfuscated_per_layer_metrics = {}
+        for layer_idx in probe_layers:
+            layer_key = str(layer_idx)
+            obfuscated_per_layer_metrics[layer_key] = _evaluate_metrics_with_threshold(
+                labels=obfuscated_results["labels"],
+                scores=obfuscated_results["layer_scores"][layer_idx],
+                threshold=float(clean_layer_thresholds[layer_key]),
+                fpr_target=fpr_target,
+            )
 
     output_dir = (
         Path(cfg.output.eval_dir)
@@ -464,10 +619,6 @@ def main(cfg: DictConfig) -> None:
         "model_name": cfg.model.name_or_path,
         "positive_split": cfg.dataset.positive_split,
         "negative_split": cfg.dataset.negative_split,
-        "num_examples": len(labels),
-        "num_positive_examples": int(sum(labels)),
-        "num_negative_examples": int(len(labels) - sum(labels)),
-        "num_skipped_examples": int(skipped_examples),
         "used_probe_paths": used_probe_paths,
         "used_layers": probe_layers,
         "suffix_checkpoint_path": None if suffix_path is None else str(suffix_path),
@@ -476,17 +627,56 @@ def main(cfg: DictConfig) -> None:
             "input": "last_token_per_layer",
             "generation": "mean_generation_token_representation_per_layer",
         },
-        "aggregate_metrics": aggregate_metrics,
-        "per_layer_metrics": per_layer_metrics,
+        "calibration": {
+            "threshold_source": "clean_non_obfuscated_test_set",
+            "fpr_target": fpr_target,
+            "aggregate_threshold": float(clean_threshold),
+            "aggregate_calibration_actual_fpr": float(clean_calibration_fpr),
+            "aggregate_calibration_tpr": float(clean_calibration_tpr),
+            "per_layer_thresholds": clean_layer_thresholds,
+        },
+        "clean": {
+            "num_examples": clean_results["num_examples"],
+            "num_positive_examples": clean_results["num_positive_examples"],
+            "num_negative_examples": clean_results["num_negative_examples"],
+            "num_skipped_examples": clean_results["num_skipped_examples"],
+            "aggregate_metrics": clean_aggregate_metrics,
+            "per_layer_metrics": clean_per_layer_metrics,
+        },
+        # Kept for downstream consumers expecting the original top-level keys.
+        "num_examples": clean_results["num_examples"],
+        "num_positive_examples": clean_results["num_positive_examples"],
+        "num_negative_examples": clean_results["num_negative_examples"],
+        "num_skipped_examples": clean_results["num_skipped_examples"],
+        "aggregate_metrics": clean_aggregate_metrics,
+        "per_layer_metrics": clean_per_layer_metrics,
     }
+    if obfuscated_results is not None:
+        payload["obfuscated"] = {
+            "threshold_source": "clean_non_obfuscated_test_set",
+            "num_examples": obfuscated_results["num_examples"],
+            "num_positive_examples": obfuscated_results["num_positive_examples"],
+            "num_negative_examples": obfuscated_results["num_negative_examples"],
+            "num_skipped_examples": obfuscated_results["num_skipped_examples"],
+            "aggregate_metrics": obfuscated_aggregate_metrics,
+            "per_layer_metrics": obfuscated_per_layer_metrics,
+        }
     with open(output_path, "w") as f:
         json.dump(payload, f, indent=2)
 
     OmegaConf.save(cfg, output_dir / "config.yaml")
 
     print(f"Saved probe eval metrics to: {output_path}")
-    print(f"Aggregate recall@{fpr_target:.2%}FPR: {aggregate_metrics['recall_at_fpr_target']:.4f}")
-    print(f"Aggregate threshold: {aggregate_metrics['threshold']:.6f}")
+    print(f"Clean threshold@{fpr_target:.2%}FPR: {clean_threshold:.6f}")
+    print(
+        f"Clean recall@fixed-threshold: "
+        f"{clean_aggregate_metrics['recall_at_threshold']:.4f}"
+    )
+    if obfuscated_aggregate_metrics is not None:
+        print(
+            f"Obfuscated recall@clean-threshold: "
+            f"{obfuscated_aggregate_metrics['recall_at_threshold']:.4f}"
+        )
 
 
 if __name__ == "__main__":
