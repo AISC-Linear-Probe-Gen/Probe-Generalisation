@@ -10,8 +10,8 @@ model:
 
 dataset:
   name: Mechanistic-Anomaly-Detection/llama3-jailbreaks
-  positive_split: circuit_breakers_train
-  negative_split: benign_instructions_train
+  positive_split: circuit_breakers_test
+  negative_split: benign_instructions_test
   prompt_col: prompt
   completion_col: completion
   add_chat_template: true
@@ -22,28 +22,29 @@ dataset:
     completion_col: null
 
 probe:
-  kind: linear # linear | mlp
   target: input # input | generation
-  layers: null # null means all layers
-  mlp_hidden: 64
+  loading:
+    checkpoint_dir: null
+    checkpoint_paths: null
+    layers: null
 
-training:
-  epochs: 200
-  activation_batch_size: 16
-  probe_batch_size: 16
-  lr: 0.001
-  weight_decay: 0.01
+suffix:
+  checkpoint_path: null
+  optim_token_str: <|optim_str|>
+
+eval:
+  batch_size: 16
+  layer_chunk_size: 28
   probe_device: auto
-  layer_chunk_size: 28 # extraction chunk size
+  fpr_target: 0.01
+  include_completion_for_input: false
+  max_positive_examples: null
+  max_negative_examples: null
   log_every: 20
 
-activations:
-  dir: null # defaults to <output.dir>/<target>/<model>/activations
-  save_dtype: bfloat16
-  overwrite: true
-
 output:
-  dir: outputs/probes/harmfulness
+  probe_dir: outputs/probes/harmfulness
+  eval_dir: outputs/probe_eval
 
 hydra:
   run:
