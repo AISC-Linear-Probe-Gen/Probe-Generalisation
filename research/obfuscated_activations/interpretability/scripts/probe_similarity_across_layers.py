@@ -12,6 +12,7 @@ import joblib
 from tqdm import tqdm
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
+import re
 
 
 def cosine_similarity_stats(n, d):
@@ -83,13 +84,15 @@ def analyze_probe_similarity(probe_dir, output_dir, n_random_vectors=5000,
     collate = []
 
     # Collect the learned weight vectors (coefficients) from each layer's probe
-    probe_files = sorted(probe_dir.glob("*.joblib"))
+    probe_files = list(probe_dir.glob("*.joblib"))
     if not probe_files:
         raise ValueError(f"No .joblib files found in {probe_dir}")
 
     for f in tqdm(probe_files, desc="Loading probes"):
-        probe_data = joblib.load(f)
-        collate.append(probe_data["model"].coef_)
+        layer_no = int(re.findall(r"layer_(\d+)", str(f))[0])
+        collate.append((layer_no, joblib.load(f)["model"].coef_))
+
+    collate = [i[1] for i in sorted(collate, key=lambda x: x[0])]
 
     # Concatenate all probe weights into a single array
     # Shape: (num_layers, activation_dim)
