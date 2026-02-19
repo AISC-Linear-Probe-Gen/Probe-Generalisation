@@ -1,0 +1,50 @@
+defaults:
+  - _self_
+
+seed: 0
+
+model:
+  name_or_path: meta-llama/Llama-3.2-3B-Instruct
+  device_map: auto
+  torch_dtype: bfloat16
+
+dataset:
+  name: Mechanistic-Anomaly-Detection/llama3-jailbreaks
+  split: circuit_breakers_train
+  prompt_col: prompt
+  completion_col: completion
+  max_examples: null
+  preprocess:
+    prompt_col:
+      - preprocessing.extract_llama_instruction
+      - preprocessing.strip
+    completion_col: null
+
+probe:
+  target: input
+  loading:
+    checkpoint_dir: null
+    checkpoint_paths: null
+    layers: null
+
+attack:
+  num_steps: 100
+  num_epochs: 1
+  batch_size: 4
+  optim_str_init: x x x x x x x x x x x x x x x x
+  lr: 0.0001
+  verbose: true
+  lambda_behavior: 0.9
+  # lambda_obf: 0.1
+  probe_type: input
+  probe_target: 0.0
+  shuffle: true
+
+output:
+  probe_dir: outputs/probes/harmfulness
+  embedding_dir: outputs/embedding_suffix
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

@@ -1,0 +1,39 @@
+[project]
+name = "obfuscated-activations"
+version = "0.1.0"
+description = "Probe-based obfuscated activation research workflows"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    "datasets>=2.10.0",
+    "hydra-core>=1.3.2",
+    "matplotlib>=3.9.0",
+    "nnsight>=0.5.12",
+    "numpy>=1.24.0",
+    "red-teaming-probes",
+    "softprompts",
+    "torch>=2.0.0",
+    "tqdm>=4.0.0",
+    "transformers>=4.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "ipykernel",
+    "pytest",
+    "ruff",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["obfuscated_activations*"]
+
+[tool.uv.sources]
+red-teaming-probes = { workspace = true }
+softprompts = { git = "https://github.com/serteal/softprompts" }
