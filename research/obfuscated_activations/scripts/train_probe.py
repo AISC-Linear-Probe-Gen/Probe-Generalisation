@@ -38,61 +38,80 @@ def main(cfg: DictConfig) -> None:
         if cfg.activations.dir is not None
         else output_dir / "activations"
     )
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    if tokenizer.pad_token_id is None:
-        raise ValueError("Tokenizer has no pad_token_id and no eos_token_id fallback.")
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        dtype=cfg.model.torch_dtype,
-        device_map=cfg.model.device_map,
-    )
-    model.eval()
-    model.config.use_cache = False
-    for param in model.parameters():
-        param.requires_grad_(False)
-
-    positive_dataset = load_dataset(
-        cfg.dataset.name,
-        split=cfg.dataset.positive_split,
-    )
-    negative_dataset = load_dataset(
-        cfg.dataset.name,
-        split=cfg.dataset.negative_split,
+    reuse_existing_activations = (
+        cfg.activations.dir is not None and not bool(cfg.activations.overwrite)
     )
 
-    prompt_preprocess = build_preprocessor_pipeline(
-        to_python(cfg.dataset.preprocess.prompt_col)
-    )
-    completion_preprocess = build_preprocessor_pipeline(
-        to_python(cfg.dataset.preprocess.completion_col)
-    )
+    if reuse_existing_activations:
+        manifest_path = activations_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"`activations.overwrite=false` and `activations.dir` is set, "
+                f"but manifest was not found at: {manifest_path}"
+            )
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        extraction_metrics = {
+            "reused_existing": True,
+            "manifest_path": str(manifest_path),
+            "num_shards": int(manifest.get("num_shards", 0)),
+            "num_items_total": int(manifest.get("num_items_total", 0)),
+        }
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        if tokenizer.pad_token_id is None:
+            raise ValueError("Tokenizer has no pad_token_id and no eos_token_id fallback.")
 
-    manifest_path, extraction_metrics = extract_activations_to_disk(
-        model=model,
-        tokenizer=tokenizer,
-        positive_dataset=positive_dataset,
-        negative_dataset=negative_dataset,
-        prompt_col=cfg.dataset.prompt_col,
-        completion_col=cfg.dataset.completion_col,
-        prompt_preprocess=prompt_preprocess,
-        completion_preprocess=completion_preprocess,
-        probe_target=cfg.probe.target,
-        activations_dir=activations_dir,
-        probe_layers=to_python(cfg.probe.layers),
-        batch_size=int(cfg.training.activation_batch_size),
-        layer_chunk_size=int(cfg.training.layer_chunk_size),
-        add_chat_template=bool(cfg.dataset.add_chat_template),
-        save_dtype=cfg.activations.save_dtype,
-        overwrite=bool(cfg.activations.overwrite),
-    )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=cfg.model.torch_dtype,
+            device_map=cfg.model.device_map,
+        )
+        model.eval()
+        model.config.use_cache = False
+        for param in model.parameters():
+            param.requires_grad_(False)
 
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        positive_dataset = load_dataset(
+            cfg.dataset.name,
+            split=cfg.dataset.positive_split,
+        )
+        negative_dataset = load_dataset(
+            cfg.dataset.name,
+            split=cfg.dataset.negative_split,
+        )
+
+        prompt_preprocess = build_preprocessor_pipeline(
+            to_python(cfg.dataset.preprocess.prompt_col)
+        )
+        completion_preprocess = build_preprocessor_pipeline(
+            to_python(cfg.dataset.preprocess.completion_col)
+        )
+
+        manifest_path, extraction_metrics = extract_activations_to_disk(
+            model=model,
+            tokenizer=tokenizer,
+            positive_dataset=positive_dataset,
+            negative_dataset=negative_dataset,
+            prompt_col=cfg.dataset.prompt_col,
+            completion_col=cfg.dataset.completion_col,
+            prompt_preprocess=prompt_preprocess,
+            completion_preprocess=completion_preprocess,
+            probe_target=cfg.probe.target,
+            activations_dir=activations_dir,
+            probe_layers=to_python(cfg.probe.layers),
+            batch_size=int(cfg.training.activation_batch_size),
+            layer_chunk_size=int(cfg.training.layer_chunk_size),
+            add_chat_template=bool(cfg.dataset.add_chat_template),
+            save_dtype=cfg.activations.save_dtype,
+            overwrite=bool(cfg.activations.overwrite),
+        )
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     probes_by_layer, training_metrics = train_probes_from_disk(
         activations_dir=activations_dir,
