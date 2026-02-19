@@ -14,7 +14,7 @@ from obfuscated_activations.attacks import (
     summarize_losses,
     train_embedding_suffix,
 )
-from obfuscated_activations.probes.online_training import normalize_model_name
+from obfuscated_activations.probes.disk_training import normalize_model_name
 from obfuscated_activations.utils.config import to_python
 from obfuscated_activations.utils.preprocessing import build_preprocessor_pipeline
 from red_teaming_probes.utils.reproducibilty import set_seed_everything

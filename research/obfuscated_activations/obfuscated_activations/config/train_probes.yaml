@@ -33,8 +33,13 @@ training:
   lr: 0.001
   weight_decay: 0.01
   probe_device: auto
-  layer_chunk_size: 28
+  layer_chunk_size: 28 # extraction chunk size
   log_every: 20
+
+activations:
+  dir: null # defaults to <output.dir>/<target>/<model>/activations
+  save_dtype: bfloat16
+  overwrite: true
 
 output:
   dir: outputs/probes/harmfulness

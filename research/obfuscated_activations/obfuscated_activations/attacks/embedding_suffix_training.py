@@ -10,7 +10,7 @@ from obfuscated_activations.attacks.softprompt import (
     ProbeObfuscatingSoftPrompt,
     ProbeObfuscatingSoftPromptConfig,
 )
-from obfuscated_activations.probes.online_training import normalize_model_name
+from obfuscated_activations.probes.disk_training import normalize_model_name
 from obfuscated_activations.utils.config import to_python
 from red_teaming_probes.probes.base import AttentionProbe, LinearProbe, MLPProbe
 
