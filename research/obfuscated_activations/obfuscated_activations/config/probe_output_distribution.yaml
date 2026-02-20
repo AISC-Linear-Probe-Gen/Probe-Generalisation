@@ -1,0 +1,55 @@
+defaults:
+  - _self_
+
+seed: 0
+
+model:
+  name_or_path: meta-llama/Llama-3.2-3B-Instruct
+  device_map: auto
+  torch_dtype: bfloat16
+
+dataset:
+  name: Mechanistic-Anomaly-Detection/llama3-jailbreaks
+  positive_split: circuit_breakers_test
+  negative_split: benign_instructions_test
+  prompt_col: prompt
+  completion_col: completion
+  add_chat_template: true
+  preprocess:
+    prompt_col:
+      - preprocessing.extract_llama_instruction
+      - preprocessing.strip
+    completion_col: null
+
+probe:
+  target: input # input | generation
+  loading:
+    checkpoint_dir: null
+    checkpoint_paths: null
+    layers: null
+
+suffix:
+  checkpoint_path: null
+  optim_token_str: <|optim_str|>
+
+eval:
+  batch_size: 16
+  layer_chunk_size: 28
+  probe_device: auto
+  include_completion_for_input: false
+  max_positive_examples: null
+  max_negative_examples: null
+  log_every: 20
+
+plot:
+  num_bins: 50
+  max_layer_plots: 28
+
+output:
+  probe_dir: outputs/probes/harmfulness
+  interpretability_dir: outputs/interpretability/probe_output_distribution
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

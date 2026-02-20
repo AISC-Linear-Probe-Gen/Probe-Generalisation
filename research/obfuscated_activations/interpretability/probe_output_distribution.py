@@ -6,18 +6,18 @@ and then post-processed those caches. It runs direct probe scoring over model
 forwards using current torch probe checkpoints (`layer_*.pt`).
 """
 
-import argparse
 import json
 import math
 from pathlib import Path
 import sys
 from typing import Any, Callable, Iterable
 
+import hydra
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from datasets import load_dataset
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
 from tqdm.auto import tqdm
@@ -30,8 +30,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from obfuscated_activations.attacks import load_probes
 from obfuscated_activations.probes.disk_training import normalize_model_name
+from obfuscated_activations.utils.config import to_python
 from obfuscated_activations.utils.preprocessing import build_preprocessor_pipeline
 from red_teaming_probes.utils.activations import ActivationCache
+from red_teaming_probes.utils.reproducibilty import set_seed_everything
 from softprompts.softprompt import (
     add_optim_token_str_at_end,
     set_tokenizer_optim_token,
@@ -416,37 +418,108 @@ def _describe_scores(values: list[float]) -> dict[str, float | int | None]:
     }
 
 
-def _plot_aggregate_distribution(
+def _split_scores_by_label(
+    labels: list[int],
+    scores: list[float],
+) -> dict[str, list[float]]:
+    if len(labels) != len(scores):
+        raise ValueError(
+            f"labels and scores must have same length, got {len(labels)} vs {len(scores)}"
+        )
+
+    harmful = [float(score) for score, label in zip(scores, labels) if int(label) == 1]
+    harmless = [float(score) for score, label in zip(scores, labels) if int(label) == 0]
+    return {
+        "harmful": harmful,
+        "harmless": harmless,
+    }
+
+
+def _describe_scores_by_label(
+    labels: list[int],
+    scores: list[float],
+) -> dict[str, dict[str, float | int | None]]:
+    split_scores = _split_scores_by_label(labels=labels, scores=scores)
+    return {
+        "harmful": _describe_scores(split_scores["harmful"]),
+        "harmless": _describe_scores(split_scores["harmless"]),
+    }
+
+
+def _plot_density_curve(
+    ax,
+    values: list[float],
+    bins: np.ndarray,
+    *,
+    label: str,
+    color: str,
+) -> None:
+    if not values:
+        return
+    hist, edges = np.histogram(values, bins=bins, density=True)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    ax.plot(
+        centers,
+        hist,
+        label=label,
+        color=color,
+        linewidth=2.0,
+    )
+
+
+def _plot_aggregate_distribution_by_class(
+    clean_labels: list[int],
     clean_scores: list[float],
+    obfuscated_labels: list[int] | None,
     obfuscated_scores: list[float] | None,
     output_path: Path,
+    num_bins: int,
 ) -> None:
-    bins = np.linspace(0.0, 1.0, 41)
+    if num_bins <= 0:
+        raise ValueError("num_bins must be > 0")
 
-    fig, ax = plt.subplots(1, 1, figsize=(7, 4.5))
-    ax.hist(
-        clean_scores,
+    clean_split = _split_scores_by_label(clean_labels, clean_scores)
+    obfuscated_split = None
+    if obfuscated_labels is not None and obfuscated_scores is not None:
+        obfuscated_split = _split_scores_by_label(obfuscated_labels, obfuscated_scores)
+
+    bins = np.linspace(0.0, 1.0, num_bins + 1)
+    fig, ax = plt.subplots(1, 1, figsize=(8, 4.8))
+    _plot_density_curve(
+        ax=ax,
+        values=clean_split["harmful"],
         bins=bins,
-        alpha=0.65,
-        label="Clean",
-        edgecolor="black",
-        linewidth=0.5,
+        label="Clean harmful",
+        color="#D55E00",
     )
-    if obfuscated_scores is not None:
-        ax.hist(
-            obfuscated_scores,
+    _plot_density_curve(
+        ax=ax,
+        values=clean_split["harmless"],
+        bins=bins,
+        label="Clean harmless",
+        color="#0072B2",
+    )
+
+    if obfuscated_split is not None:
+        _plot_density_curve(
+            ax=ax,
+            values=obfuscated_split["harmful"],
             bins=bins,
-            alpha=0.65,
-            label="Obfuscated",
-            edgecolor="black",
-            linewidth=0.5,
-            color="orange",
+            label="Obfuscated harmful",
+            color="#E69F00",
+        )
+        _plot_density_curve(
+            ax=ax,
+            values=obfuscated_split["harmless"],
+            bins=bins,
+            label="Obfuscated harmless",
+            color="#009E73",
         )
 
     ax.set_xlabel("Mean score across probe layers")
-    ax.set_ylabel("Frequency")
+    ax.set_ylabel("Density")
     ax.set_xlim(0.0, 1.0)
-    ax.set_title("Aggregate probe score distribution")
+    ax.set_title("Aggregate probe score distribution by class")
     ax.grid(alpha=0.3)
     ax.legend()
 
@@ -534,193 +607,116 @@ def _plot_layer_distributions(
     plt.close(fig)
 
 
-def _default_output_dir(model_name: str, probe_target: str) -> Path:
-    return (
-        Path("outputs/interpretability/probe_output_distribution")
-        / probe_target
-        / normalize_model_name(model_name)
-    )
+def _default_output_dir(
+    output_root: str,
+    model_name: str,
+    probe_target: str,
+) -> Path:
+    return Path(output_root) / probe_target / normalize_model_name(model_name)
 
 
-def _build_load_probe_cfg(args: argparse.Namespace) -> Any:
-    checkpoint_paths = None
-    if args.probe_checkpoint_paths:
-        checkpoint_paths = [str(path) for path in args.probe_checkpoint_paths]
+@hydra.main(
+    version_base=None,
+    config_path="../obfuscated_activations/config",
+    config_name="probe_output_distribution",
+)
+def main(cfg: DictConfig) -> None:
+    set_seed_everything(int(cfg.seed))
 
-    return OmegaConf.create(
-        {
-            "model": {"name_or_path": args.model_name},
-            "probe": {
-                "target": args.probe_target,
-                "loading": {
-                    "checkpoint_dir": (
-                        None
-                        if args.probe_checkpoint_dir is None
-                        else str(args.probe_checkpoint_dir)
-                    ),
-                    "checkpoint_paths": checkpoint_paths,
-                    "layers": args.probe_layers,
-                },
-            },
-            "output": {"probe_dir": str(args.probe_root_dir)},
-        }
-    )
+    model_name = str(cfg.model.name_or_path)
+    probe_target = str(cfg.probe.target)
+    if probe_target not in {"input", "generation"}:
+        raise ValueError("probe.target must be one of {'input', 'generation'}")
 
+    batch_size = int(cfg.eval.batch_size)
+    layer_chunk_size = int(cfg.eval.layer_chunk_size)
+    max_layer_plots = int(cfg.plot.max_layer_plots)
+    num_bins = int(cfg.plot.num_bins)
+    if batch_size <= 0:
+        raise ValueError("eval.batch_size must be > 0")
+    if layer_chunk_size <= 0:
+        raise ValueError("eval.layer_chunk_size must be > 0")
+    if max_layer_plots <= 0:
+        raise ValueError("plot.max_layer_plots must be > 0")
+    if num_bins <= 0:
+        raise ValueError("plot.num_bins must be > 0")
 
-def _create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Analyze probe score distributions for clean and optionally obfuscated "
-            "inputs using current torch probe checkpoints."
-        )
-    )
-    parser.add_argument("--model-name", type=str, required=True)
-    parser.add_argument(
-        "--dataset-name",
-        type=str,
-        default="Mechanistic-Anomaly-Detection/llama3-jailbreaks",
-    )
-    parser.add_argument("--positive-split", type=str, default="circuit_breakers_test")
-    parser.add_argument("--negative-split", type=str, default="benign_instructions_test")
-    parser.add_argument("--prompt-col", type=str, default="prompt")
-    parser.add_argument("--completion-col", type=str, default="completion")
-
-    parser.add_argument(
-        "--prompt-preprocess",
-        nargs="*",
-        default=["preprocessing.extract_llama_instruction", "preprocessing.strip"],
-        help="Preprocessing callables for prompt text.",
-    )
-    parser.add_argument(
-        "--completion-preprocess",
-        nargs="*",
-        default=None,
-        help="Preprocessing callables for completion text.",
-    )
-    parser.add_argument(
-        "--add-chat-template",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-
-    parser.add_argument("--probe-target", choices=["input", "generation"], default="input")
-    parser.add_argument("--probe-checkpoint-dir", type=Path, default=None)
-    parser.add_argument(
-        "--probe-checkpoint-paths",
-        type=Path,
-        nargs="*",
-        default=None,
-        help="Explicit probe checkpoint paths. Overrides --probe-checkpoint-dir.",
-    )
-    parser.add_argument("--probe-layers", type=int, nargs="*", default=None)
-    parser.add_argument(
-        "--probe-root-dir",
-        type=Path,
-        default=Path("outputs/probes/harmfulness"),
-        help="Base probe output root when probe checkpoint location is not explicit.",
-    )
-
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--layer-chunk-size", type=int, default=28)
-    parser.add_argument("--probe-device", type=str, default="auto")
-    parser.add_argument(
-        "--include-completion-for-input",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    parser.add_argument("--max-positive-examples", type=int, default=None)
-    parser.add_argument("--max-negative-examples", type=int, default=None)
-    parser.add_argument("--log-every", type=int, default=20)
-
-    parser.add_argument("--suffix-checkpoint-path", type=Path, default=None)
-    parser.add_argument("--optim-token-str", type=str, default="<|optim_str|>")
-
-    parser.add_argument("--device-map", type=str, default="auto")
-    parser.add_argument("--torch-dtype", type=str, default="bfloat16")
-
-    parser.add_argument("--max-layer-plots", type=int, default=28)
-    parser.add_argument("--output-dir", type=Path, default=None)
-
-    return parser
-
-
-def main() -> None:
-    parser = _create_parser()
-    args = parser.parse_args()
-
-    if args.batch_size <= 0:
-        raise ValueError("--batch-size must be > 0")
-    if args.layer_chunk_size <= 0:
-        raise ValueError("--layer-chunk-size must be > 0")
-    if args.max_layer_plots <= 0:
-        raise ValueError("--max-layer-plots must be > 0")
-
-    output_dir = args.output_dir or _default_output_dir(
-        model_name=args.model_name,
-        probe_target=args.probe_target,
+    output_dir = _default_output_dir(
+        output_root=str(cfg.output.interpretability_dir),
+        model_name=model_name,
+        probe_target=probe_target,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading model and tokenizer: {args.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    print(f"Loading model and tokenizer: {model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.pad_token_id is None:
         raise ValueError("Tokenizer has no pad_token_id and no eos_token_id fallback.")
 
-    device_map = None if args.device_map in {"none", "null"} else args.device_map
-    torch_dtype = _resolve_torch_dtype(args.torch_dtype)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        device_map=device_map,
-        torch_dtype=torch_dtype,
+        model_name,
+        device_map=cfg.model.device_map,
+        torch_dtype=_resolve_torch_dtype(str(cfg.model.torch_dtype)),
     )
     model.eval()
     model.config.use_cache = False
     for param in model.parameters():
         param.requires_grad_(False)
 
-    print(f"Loading dataset: {args.dataset_name}")
-    positive_dataset = load_dataset(args.dataset_name, split=args.positive_split)
-    negative_dataset = load_dataset(args.dataset_name, split=args.negative_split)
+    print(f"Loading dataset: {cfg.dataset.name}")
+    positive_dataset = load_dataset(
+        cfg.dataset.name,
+        split=cfg.dataset.positive_split,
+    )
+    negative_dataset = load_dataset(
+        cfg.dataset.name,
+        split=cfg.dataset.negative_split,
+    )
 
-    if args.max_positive_examples is not None:
+    max_pos = cfg.eval.max_positive_examples
+    if max_pos is not None:
         positive_dataset = positive_dataset.select(
-            range(min(len(positive_dataset), int(args.max_positive_examples)))
+            range(min(len(positive_dataset), int(max_pos)))
         )
-    if args.max_negative_examples is not None:
+    max_neg = cfg.eval.max_negative_examples
+    if max_neg is not None:
         negative_dataset = negative_dataset.select(
-            range(min(len(negative_dataset), int(args.max_negative_examples)))
+            range(min(len(negative_dataset), int(max_neg)))
         )
 
-    prompt_preprocess = build_preprocessor_pipeline(args.prompt_preprocess)
-    completion_preprocess = build_preprocessor_pipeline(args.completion_preprocess)
+    prompt_preprocess = build_preprocessor_pipeline(
+        to_python(cfg.dataset.preprocess.prompt_col)
+    )
+    completion_preprocess = build_preprocessor_pipeline(
+        to_python(cfg.dataset.preprocess.completion_col)
+    )
 
     print("Loading probe checkpoints")
-    probe_cfg = _build_load_probe_cfg(args)
-    probes_by_layer, used_probe_paths = load_probes(probe_cfg)
+    probes_by_layer, used_probe_paths = load_probes(cfg)
     probe_layers = sorted(probes_by_layer.keys())
     if not probe_layers:
         raise RuntimeError("No probe checkpoints were loaded.")
 
-    probe_device = _resolve_probe_device(args.probe_device)
+    probe_device = _resolve_probe_device(str(cfg.eval.probe_device))
     for layer_idx in probe_layers:
         probe = probes_by_layer[layer_idx].to(probe_device).eval()
         for param in probe.parameters():
             param.requires_grad_(False)
         probes_by_layer[layer_idx] = probe
 
+    suffix_path = cfg.suffix.checkpoint_path
     optim_embeds: Tensor | None = None
-    if args.suffix_checkpoint_path is not None:
-        set_tokenizer_optim_token(tokenizer, args.optim_token_str)
-        suffix_payload = torch.load(args.suffix_checkpoint_path, map_location="cpu")
+    if suffix_path is not None:
+        set_tokenizer_optim_token(tokenizer, str(cfg.suffix.optim_token_str))
+        suffix_payload = torch.load(Path(suffix_path), map_location="cpu")
         optim_embeds = suffix_payload["optim_embeds"]
         if optim_embeds.dim() == 3 and optim_embeds.shape[0] == 1:
             optim_embeds = optim_embeds.squeeze(0)
         if optim_embeds.dim() != 2:
             raise ValueError(
-                "Expected optim_embeds with shape [soft_len, hidden], got "
-                f"{tuple(optim_embeds.shape)}"
+                f"Expected optim_embeds with shape [soft_len, hidden], got {tuple(optim_embeds.shape)}"
             )
 
     print("Running clean scoring pass")
@@ -729,21 +725,21 @@ def main() -> None:
         tokenizer=tokenizer,
         positive_dataset=positive_dataset,
         negative_dataset=negative_dataset,
-        prompt_col=args.prompt_col,
-        completion_col=args.completion_col,
+        prompt_col=cfg.dataset.prompt_col,
+        completion_col=cfg.dataset.completion_col,
         prompt_preprocess=prompt_preprocess,
         completion_preprocess=completion_preprocess,
-        probe_target=args.probe_target,
-        add_chat_template=bool(args.add_chat_template),
-        include_completion_for_input=bool(args.include_completion_for_input),
+        probe_target=probe_target,
+        add_chat_template=bool(cfg.dataset.add_chat_template),
+        include_completion_for_input=bool(cfg.eval.include_completion_for_input),
         probes_by_layer=probes_by_layer,
         probe_layers=probe_layers,
         probe_device=probe_device,
-        batch_size=int(args.batch_size),
-        layer_chunk_size=int(args.layer_chunk_size),
-        log_every=int(args.log_every),
+        batch_size=batch_size,
+        layer_chunk_size=layer_chunk_size,
+        log_every=int(cfg.eval.log_every),
         optim_embeds=None,
-        optim_token_str=args.optim_token_str,
+        optim_token_str=str(cfg.suffix.optim_token_str),
         progress_label="clean",
     )
     if not clean_results["aggregate_scores"]:
@@ -759,35 +755,41 @@ def main() -> None:
             tokenizer=tokenizer,
             positive_dataset=positive_dataset,
             negative_dataset=negative_dataset,
-            prompt_col=args.prompt_col,
-            completion_col=args.completion_col,
+            prompt_col=cfg.dataset.prompt_col,
+            completion_col=cfg.dataset.completion_col,
             prompt_preprocess=prompt_preprocess,
             completion_preprocess=completion_preprocess,
-            probe_target=args.probe_target,
-            add_chat_template=bool(args.add_chat_template),
-            include_completion_for_input=bool(args.include_completion_for_input),
+            probe_target=probe_target,
+            add_chat_template=bool(cfg.dataset.add_chat_template),
+            include_completion_for_input=bool(cfg.eval.include_completion_for_input),
             probes_by_layer=probes_by_layer,
             probe_layers=probe_layers,
             probe_device=probe_device,
-            batch_size=int(args.batch_size),
-            layer_chunk_size=int(args.layer_chunk_size),
-            log_every=int(args.log_every),
+            batch_size=batch_size,
+            layer_chunk_size=layer_chunk_size,
+            log_every=int(cfg.eval.log_every),
             optim_embeds=optim_embeds,
-            optim_token_str=args.optim_token_str,
+            optim_token_str=str(cfg.suffix.optim_token_str),
             progress_label="obfuscated",
         )
 
-    aggregate_plot_path = output_dir / "aggregate_score_distribution.png"
+    aggregate_plot_path = output_dir / "aggregate_score_distribution_by_class.png"
     per_layer_plot_path = output_dir / "per_layer_score_distribution.png"
-
-    _plot_aggregate_distribution(
+    _plot_aggregate_distribution_by_class(
+        clean_labels=clean_results["labels"],
         clean_scores=clean_results["aggregate_scores"],
+        obfuscated_labels=(
+            None
+            if obfuscated_results is None
+            else obfuscated_results["labels"]
+        ),
         obfuscated_scores=(
             None
             if obfuscated_results is None
             else obfuscated_results["aggregate_scores"]
         ),
         output_path=aggregate_plot_path,
+        num_bins=num_bins,
     )
 
     _plot_layer_distributions(
@@ -798,28 +800,30 @@ def main() -> None:
             else obfuscated_results["layer_scores"]
         ),
         output_path=per_layer_plot_path,
-        max_layers=int(args.max_layer_plots),
+        max_layers=max_layer_plots,
     )
 
+    clean_score_stats = _describe_scores(clean_results["aggregate_scores"])
+    clean_class_stats = _describe_scores_by_label(
+        labels=clean_results["labels"],
+        scores=clean_results["aggregate_scores"],
+    )
     summary: dict[str, Any] = {
-        "model_name": args.model_name,
-        "dataset_name": args.dataset_name,
-        "positive_split": args.positive_split,
-        "negative_split": args.negative_split,
-        "probe_target": args.probe_target,
+        "model_name": model_name,
+        "dataset_name": cfg.dataset.name,
+        "positive_split": cfg.dataset.positive_split,
+        "negative_split": cfg.dataset.negative_split,
+        "probe_target": probe_target,
         "used_probe_paths": used_probe_paths,
         "used_probe_layers": probe_layers,
-        "suffix_checkpoint_path": (
-            None
-            if args.suffix_checkpoint_path is None
-            else str(args.suffix_checkpoint_path)
-        ),
+        "suffix_checkpoint_path": None if suffix_path is None else str(suffix_path),
         "clean": {
             "num_examples": clean_results["num_examples"],
             "num_positive_examples": clean_results["num_positive_examples"],
             "num_negative_examples": clean_results["num_negative_examples"],
             "num_skipped_examples": clean_results["num_skipped_examples"],
-            "aggregate_scores": _describe_scores(clean_results["aggregate_scores"]),
+            "aggregate_scores": clean_score_stats,
+            "aggregate_scores_by_label": clean_class_stats,
             "per_layer_scores": {
                 str(layer_idx): _describe_scores(clean_results["layer_scores"][layer_idx])
                 for layer_idx in probe_layers
@@ -832,33 +836,52 @@ def main() -> None:
     }
 
     if obfuscated_results is not None:
-        clean_mean = summary["clean"]["aggregate_scores"]["mean"]
-        obf_agg = _describe_scores(obfuscated_results["aggregate_scores"])
-
+        obf_score_stats = _describe_scores(obfuscated_results["aggregate_scores"])
+        obf_class_stats = _describe_scores_by_label(
+            labels=obfuscated_results["labels"],
+            scores=obfuscated_results["aggregate_scores"],
+        )
         summary["obfuscated"] = {
             "num_examples": obfuscated_results["num_examples"],
             "num_positive_examples": obfuscated_results["num_positive_examples"],
             "num_negative_examples": obfuscated_results["num_negative_examples"],
             "num_skipped_examples": obfuscated_results["num_skipped_examples"],
-            "aggregate_scores": obf_agg,
+            "aggregate_scores": obf_score_stats,
+            "aggregate_scores_by_label": obf_class_stats,
             "per_layer_scores": {
                 str(layer_idx): _describe_scores(obfuscated_results["layer_scores"][layer_idx])
                 for layer_idx in probe_layers
             },
         }
 
-        obf_mean = obf_agg["mean"]
+        clean_mean = clean_score_stats["mean"]
+        obf_mean = obf_score_stats["mean"]
+        clean_harmful_mean = clean_class_stats["harmful"]["mean"]
+        obf_harmful_mean = obf_class_stats["harmful"]["mean"]
+        clean_harmless_mean = clean_class_stats["harmless"]["mean"]
+        obf_harmless_mean = obf_class_stats["harmless"]["mean"]
         summary["obfuscated_vs_clean_delta"] = {
             "aggregate_mean_delta": (
                 None
                 if clean_mean is None or obf_mean is None
                 else float(obf_mean - clean_mean)
-            )
+            ),
+            "harmful_mean_delta": (
+                None
+                if clean_harmful_mean is None or obf_harmful_mean is None
+                else float(obf_harmful_mean - clean_harmful_mean)
+            ),
+            "harmless_mean_delta": (
+                None
+                if clean_harmless_mean is None or obf_harmless_mean is None
+                else float(obf_harmless_mean - clean_harmless_mean)
+            ),
         }
 
     summary_path = output_dir / "summary.json"
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
+    OmegaConf.save(cfg, output_dir / "config.yaml")
 
     print(f"Saved aggregate plot to: {aggregate_plot_path}")
     print(f"Saved per-layer plot to: {per_layer_plot_path}")
