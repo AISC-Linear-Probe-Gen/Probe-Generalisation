@@ -1,267 +1,868 @@
 #!/usr/bin/env python3
-"""
-Analyze probe output distributions for baseline and obfuscated activations.
+"""Analyze clean vs obfuscated probe score distributions in a single pass.
 
-This script loads probes and cached activations, computes predictions and logits,
-and generates visualizations comparing baseline and obfuscated activations.
+This script replaces the legacy two-step workflow that first cached activations
+and then post-processed those caches. It runs direct probe scoring over model
+forwards using current torch probe checkpoints (`layer_*.pt`).
 """
 
 import argparse
-import torch
+import json
+import math
 from pathlib import Path
+import sys
+from typing import Any, Callable, Iterable
+
 import matplotlib.pyplot as plt
 import numpy as np
-import re
-import joblib
-from collections import defaultdict
+import torch
+from datasets import load_dataset
+from omegaconf import OmegaConf
+from torch import Tensor, nn
+from torch.nn.utils.rnn import pad_sequence
+from tqdm.auto import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Allow direct execution without requiring editable install.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from obfuscated_activations.attacks import load_probes
+from obfuscated_activations.probes.disk_training import normalize_model_name
+from obfuscated_activations.utils.preprocessing import build_preprocessor_pipeline
+from red_teaming_probes.utils.activations import ActivationCache
+from softprompts.softprompt import (
+    add_optim_token_str_at_end,
+    set_tokenizer_optim_token,
+    split_tokenized_messages_on_optim_str,
+    tokenize,
+)
 
 
-def extract_layer_number(filepath: str) -> int:
-    """Extract layer number from filepath using regex."""
-    filename = Path(filepath).stem
+def _chunked(items: list[int], chunk_size: int) -> Iterable[list[int]]:
+    for idx in range(0, len(items), chunk_size):
+        yield items[idx : idx + chunk_size]
 
-    match = re.search(r'layer_(\d+)', filename)
 
-    if match:
-        return int(match.group(1))
+def _resolve_probe_device(probe_device: str) -> torch.device:
+    if probe_device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(probe_device)
+
+
+def _resolve_torch_dtype(dtype: str) -> torch.dtype | str:
+    value = dtype.strip().lower()
+    if value == "auto":
+        return "auto"
+    if value in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if value in {"fp16", "float16", "half"}:
+        return torch.float16
+    if value in {"fp32", "float32", "float"}:
+        return torch.float32
+    raise ValueError(f"Unsupported torch dtype: {dtype}")
+
+
+def _prepare_example_plain(
+    tokenizer,
+    prompt_text: str,
+    completion_text: str,
+    label: int,
+    probe_target: str,
+    add_chat_template: bool,
+    include_completion_for_input: bool,
+) -> dict[str, Any] | None:
+    if add_chat_template:
+        formatted_prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt_text}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
     else:
-        raise ValueError(f"Could not extract layer number from filename: {filepath}")
+        formatted_prompt = prompt_text
+
+    prompt_ids = tokenizer(formatted_prompt, add_special_tokens=False).input_ids
+    prompt_len = len(prompt_ids)
+    if prompt_len == 0:
+        return None
+
+    if probe_target == "generation" or include_completion_for_input:
+        completion_for_forward = completion_text
+    else:
+        completion_for_forward = ""
+
+    full_ids = tokenizer(
+        formatted_prompt + completion_for_forward,
+        return_tensors="pt",
+        add_special_tokens=False,
+    ).input_ids[0]
+
+    if probe_target == "input":
+        start_idx = prompt_len - 1
+        end_idx = start_idx + 1
+    elif probe_target == "generation":
+        start_idx = prompt_len
+        end_idx = full_ids.shape[0]
+    else:
+        raise ValueError(f"Unknown probe target: {probe_target}")
+
+    if end_idx <= start_idx:
+        return None
+
+    return {
+        "label": int(label),
+        "start_idx": int(start_idx),
+        "end_idx": int(end_idx),
+        "input_ids": full_ids,
+    }
 
 
-def quick_pred(probe, activations):
-    """Generate predictions and logits from probe and activations."""
-    activations = activations.float().numpy()
-    scaled_activations = probe["scaler"].transform(activations)
-    logits = probe["model"].decision_function(scaled_activations)
-    predictions = probe["model"].predict(scaled_activations)
-    return predictions, logits
+def _prepare_example_with_suffix(
+    model,
+    tokenizer,
+    prompt_text: str,
+    completion_text: str,
+    label: int,
+    probe_target: str,
+    add_chat_template: bool,
+    include_completion_for_input: bool,
+    optim_embeds: Tensor,
+    optim_token_str: str,
+) -> dict[str, Any] | None:
+    if probe_target == "generation" or include_completion_for_input:
+        completion_for_forward = completion_text
+    else:
+        completion_for_forward = ""
+
+    message_with_token = add_optim_token_str_at_end(prompt_text, optim_token_str)[0]
+    prompt_ids, prompt_mask = tokenize(
+        tokenizer,
+        message_with_token,
+        add_chat_template=add_chat_template,
+    )
+    left_ids, right_ids, _, _ = split_tokenized_messages_on_optim_str(
+        prompt_ids,
+        prompt_mask,
+        tokenizer.optim_token_id,
+    )
+
+    completion_ids = tokenizer(
+        completion_for_forward,
+        return_tensors="pt",
+        add_special_tokens=False,
+    ).input_ids
+
+    embed_layer = model.get_input_embeddings()
+    model_device = embed_layer.weight.device
+    embed_dtype = embed_layer.weight.dtype
+
+    before_embeds = embed_layer(left_ids.to(model_device))
+    after_embeds = embed_layer(right_ids.to(model_device))
+    completion_embeds = embed_layer(completion_ids.to(model_device))
+    suffix_embeds = optim_embeds.to(device=model_device, dtype=embed_dtype).unsqueeze(0)
+
+    input_embeds = torch.cat(
+        [before_embeds, suffix_embeds, after_embeds, completion_embeds],
+        dim=1,
+    )[0]
+
+    prefix_len = int(before_embeds.shape[1] + suffix_embeds.shape[1] + after_embeds.shape[1])
+    completion_len = int(completion_ids.shape[1])
+
+    if probe_target == "input":
+        start_idx = prefix_len - 1
+        end_idx = start_idx + 1
+    elif probe_target == "generation":
+        start_idx = prefix_len
+        end_idx = prefix_len + completion_len
+    else:
+        raise ValueError(f"Unknown probe target: {probe_target}")
+
+    if end_idx <= start_idx:
+        return None
+
+    return {
+        "label": int(label),
+        "start_idx": int(start_idx),
+        "end_idx": int(end_idx),
+        "input_embeds": input_embeds,
+    }
 
 
-def load_probes(probe_dir: Path):
-    """Load all probes from directory and organize by layer."""
-    probes_by_layer = {}
-    for probe_file in probe_dir.glob("*.joblib"):
-        layer = extract_layer_number(str(probe_file))
-        probe = joblib.load(probe_file)
-        probes_by_layer[layer] = probe
-    print(f"Loaded {len(probes_by_layer)} probes from {probe_dir}")
-    return probes_by_layer
+def _build_input_id_batch(
+    prepared_examples: list[dict[str, Any]],
+    pad_token_id: int,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    input_ids_list = [item["input_ids"] for item in prepared_examples]
+    input_ids = pad_sequence(
+        input_ids_list,
+        batch_first=True,
+        padding_value=pad_token_id,
+    ).to(device)
+    lengths = torch.tensor([ids.shape[0] for ids in input_ids_list], device=device)
+    positions = torch.arange(input_ids.shape[1], device=device).unsqueeze(0)
+    attention_mask = (positions < lengths.unsqueeze(1)).long()
+    return input_ids, attention_mask
 
 
-def process_activations(activations_dir: Path, probes_by_layer: dict):
-    """Process all activation files and compute predictions/logits."""
-    baseline_predictions_by_layer = defaultdict(list)
-    baseline_logits_by_layer = defaultdict(list)
-    obfuscated_predictions_by_layer = defaultdict(list)
-    obfuscated_logits_by_layer = defaultdict(list)
+def _build_embed_batch(
+    prepared_examples: list[dict[str, Any]],
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    embeds_list = [item["input_embeds"] for item in prepared_examples]
+    input_embeds = pad_sequence(
+        embeds_list,
+        batch_first=True,
+        padding_value=0.0,
+    ).to(device)
+    lengths = torch.tensor([emb.shape[0] for emb in embeds_list], device=device)
+    positions = torch.arange(input_embeds.shape[1], device=device).unsqueeze(0)
+    attention_mask = (positions < lengths.unsqueeze(1)).long()
+    return input_embeds, attention_mask
 
-    activation_files = list(activations_dir.glob("*.pt"))
-    print(f"Processing {len(activation_files)} activation files from {activations_dir}")
 
-    for activation_file in activation_files:
-        baseline_activations, obfuscated_activations = torch.load(
-            activation_file, weights_only=False
+def _probe_logits_for_hidden(
+    probe: nn.Module,
+    hidden: Tensor,
+    probe_device: torch.device,
+) -> Tensor:
+    probe_input = hidden.to(probe_device).float()
+    logits = probe(probe_input)
+    if logits.dim() > 1:
+        logits = logits.squeeze(-1)
+    return logits
+
+
+def _collect_scores(
+    *,
+    model,
+    tokenizer,
+    positive_dataset,
+    negative_dataset,
+    prompt_col: str,
+    completion_col: str,
+    prompt_preprocess: Callable[[Any], str],
+    completion_preprocess: Callable[[Any], str],
+    probe_target: str,
+    add_chat_template: bool,
+    include_completion_for_input: bool,
+    probes_by_layer: dict[int, nn.Module],
+    probe_layers: list[int],
+    probe_device: torch.device,
+    batch_size: int,
+    layer_chunk_size: int,
+    log_every: int,
+    optim_embeds: Tensor | None = None,
+    optim_token_str: str = "<|optim_str|>",
+    progress_label: str = "eval",
+) -> dict[str, Any]:
+    sample_refs = [("positive", idx, 1) for idx in range(len(positive_dataset))] + [
+        ("negative", idx, 0) for idx in range(len(negative_dataset))
+    ]
+
+    model_device = model.get_input_embeddings().weight.device
+    layer_scores: dict[int, list[float]] = {layer_idx: [] for layer_idx in probe_layers}
+    aggregate_scores: list[float] = []
+    labels: list[int] = []
+    skipped_examples = 0
+
+    total_batches = (len(sample_refs) + batch_size - 1) // batch_size
+    progress = tqdm(
+        total=total_batches,
+        desc=f"{progress_label} scoring",
+        dynamic_ncols=True,
+    )
+    try:
+        for batch_start in range(0, len(sample_refs), batch_size):
+            batch_refs = sample_refs[batch_start : batch_start + batch_size]
+            prepared_examples = []
+            for source, idx, label in batch_refs:
+                row = (
+                    positive_dataset[int(idx)]
+                    if source == "positive"
+                    else negative_dataset[int(idx)]
+                )
+                prompt_text = prompt_preprocess(row.get(prompt_col, ""))
+                completion_text = completion_preprocess(row.get(completion_col, ""))
+
+                if optim_embeds is None:
+                    prepared = _prepare_example_plain(
+                        tokenizer=tokenizer,
+                        prompt_text=prompt_text,
+                        completion_text=completion_text,
+                        label=label,
+                        probe_target=probe_target,
+                        add_chat_template=add_chat_template,
+                        include_completion_for_input=include_completion_for_input,
+                    )
+                else:
+                    prepared = _prepare_example_with_suffix(
+                        model=model,
+                        tokenizer=tokenizer,
+                        prompt_text=prompt_text,
+                        completion_text=completion_text,
+                        label=label,
+                        probe_target=probe_target,
+                        add_chat_template=add_chat_template,
+                        include_completion_for_input=include_completion_for_input,
+                        optim_embeds=optim_embeds,
+                        optim_token_str=optim_token_str,
+                    )
+
+                if prepared is None:
+                    skipped_examples += 1
+                    continue
+                prepared_examples.append(prepared)
+
+            if not prepared_examples:
+                progress.update(1)
+                continue
+
+            if optim_embeds is None:
+                input_ids, attention_mask = _build_input_id_batch(
+                    prepared_examples=prepared_examples,
+                    pad_token_id=tokenizer.pad_token_id,
+                    device=model_device,
+                )
+                model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+            else:
+                input_embeds, attention_mask = _build_embed_batch(
+                    prepared_examples=prepared_examples,
+                    device=model_device,
+                )
+                model_inputs = {"inputs_embeds": input_embeds, "attention_mask": attention_mask}
+
+            sample_layer_scores: list[list[float]] = [[] for _ in prepared_examples]
+            for layer_chunk in _chunked(probe_layers, layer_chunk_size):
+                cache = ActivationCache(model=model, layer_indices=layer_chunk)
+                with torch.inference_mode():
+                    with cache.capture():
+                        _ = model(**model_inputs, use_cache=False)
+
+                for layer_idx in layer_chunk:
+                    probe = probes_by_layer[layer_idx]
+                    layer_hidden = cache.get(layer_idx)
+                    for sample_idx, sample in enumerate(prepared_examples):
+                        if probe_target == "input":
+                            hidden = layer_hidden[sample_idx, int(sample["start_idx"]), :].unsqueeze(0)
+                        else:
+                            token_h = layer_hidden[
+                                sample_idx,
+                                int(sample["start_idx"]) : int(sample["end_idx"]),
+                                :,
+                            ]
+                            hidden = token_h.mean(dim=0, keepdim=True)
+
+                        logits = _probe_logits_for_hidden(
+                            probe=probe,
+                            hidden=hidden,
+                            probe_device=probe_device,
+                        )
+                        score = float(torch.sigmoid(logits).mean().detach().cpu().item())
+                        sample_layer_scores[sample_idx].append(score)
+                        layer_scores[layer_idx].append(score)
+                    del layer_hidden
+                del cache
+
+            for sample_idx, sample in enumerate(prepared_examples):
+                if not sample_layer_scores[sample_idx]:
+                    continue
+                aggregate_scores.append(float(np.mean(sample_layer_scores[sample_idx])))
+                labels.append(int(sample["label"]))
+
+            del prepared_examples, sample_layer_scores, model_inputs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            progress.update(1)
+            if log_every > 0 and progress.n % log_every == 0:
+                progress.set_postfix(
+                    scored=len(labels),
+                    skipped=skipped_examples,
+                )
+    finally:
+        progress.close()
+
+    return {
+        "labels": labels,
+        "aggregate_scores": aggregate_scores,
+        "layer_scores": layer_scores,
+        "num_skipped_examples": int(skipped_examples),
+        "num_examples": int(len(labels)),
+        "num_positive_examples": int(sum(labels)),
+        "num_negative_examples": int(len(labels) - sum(labels)),
+    }
+
+
+def _describe_scores(values: list[float]) -> dict[str, float | int | None]:
+    if not values:
+        return {
+            "count": 0,
+            "mean": None,
+            "std": None,
+            "min": None,
+            "max": None,
+        }
+
+    arr = np.array(values, dtype=np.float64)
+    return {
+        "count": int(arr.size),
+        "mean": float(arr.mean()),
+        "std": float(arr.std()),
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+    }
+
+
+def _plot_aggregate_distribution(
+    clean_scores: list[float],
+    obfuscated_scores: list[float] | None,
+    output_path: Path,
+) -> None:
+    bins = np.linspace(0.0, 1.0, 41)
+
+    fig, ax = plt.subplots(1, 1, figsize=(7, 4.5))
+    ax.hist(
+        clean_scores,
+        bins=bins,
+        alpha=0.65,
+        label="Clean",
+        edgecolor="black",
+        linewidth=0.5,
+    )
+    if obfuscated_scores is not None:
+        ax.hist(
+            obfuscated_scores,
+            bins=bins,
+            alpha=0.65,
+            label="Obfuscated",
+            edgecolor="black",
+            linewidth=0.5,
+            color="orange",
         )
 
-        baseline_activations.positions = -1
-        obfuscated_activations.positions = -1
-
-        baseline_activations = baseline_activations.extract_positions()
-        obfuscated_activations = obfuscated_activations.extract_positions()
-
-        for layer, _ in baseline_activations:
-            probe = probes_by_layer[layer]
-
-            baseline_layer_activations = baseline_activations[(layer, "layer_out")]
-            baseline_predictions, baseline_logits = quick_pred(probe, baseline_layer_activations)
-
-            obfuscated_layer_activations = obfuscated_activations[(layer, "layer_out")]
-            obfuscated_predictions, obfuscated_logits = quick_pred(probe, obfuscated_layer_activations)
-
-            baseline_predictions_by_layer[layer].append(baseline_predictions)
-            baseline_logits_by_layer[layer].append(baseline_logits)
-            obfuscated_predictions_by_layer[layer].append(obfuscated_predictions)
-            obfuscated_logits_by_layer[layer].append(obfuscated_logits)
-
-    return (baseline_predictions_by_layer, baseline_logits_by_layer,
-            obfuscated_predictions_by_layer, obfuscated_logits_by_layer)
-
-
-def compute_average_predictions(baseline_predictions_by_layer, obfuscated_predictions_by_layer):
-    """Compute average predictions across all layers."""
-    # Concatenate predictions across activation files for each layer
-    baseline_preds_concatenated = {}
-    obfuscated_preds_concatenated = {}
-
-    for layer in sorted(baseline_predictions_by_layer.keys()):
-        baseline_preds_concatenated[layer] = np.concatenate(baseline_predictions_by_layer[layer])
-        obfuscated_preds_concatenated[layer] = np.concatenate(obfuscated_predictions_by_layer[layer])
-
-    print(f"\nNumber of layers: {len(baseline_preds_concatenated)}")
-    print(f"Number of datapoints per layer: {baseline_preds_concatenated[list(baseline_preds_concatenated.keys())[0]].shape}")
-
-    # Stack predictions from all layers (shape: num_layers x num_datapoints)
-    baseline_preds_stacked = np.stack([baseline_preds_concatenated[layer] for layer in sorted(baseline_preds_concatenated.keys())])
-    obfuscated_preds_stacked = np.stack([obfuscated_preds_concatenated[layer] for layer in sorted(obfuscated_preds_concatenated.keys())])
-
-    # Average across layers (axis=0)
-    baseline_avg_preds = baseline_preds_stacked.mean(axis=0)
-    obfuscated_avg_preds = obfuscated_preds_stacked.mean(axis=0)
-
-    print(f"Shape of stacked predictions: {baseline_preds_stacked.shape}")
-    print(f"Shape of averaged predictions: {baseline_avg_preds.shape}")
-    print(f"\nBaseline average predictions (first 10): {baseline_avg_preds[:10]}")
-    print(f"Obfuscated average predictions (first 10): {obfuscated_avg_preds[:10]}")
-
-    return baseline_avg_preds, obfuscated_avg_preds
-
-
-def plot_average_predictions(baseline_avg_preds, obfuscated_avg_preds, output_dir: Path):
-    """Plot distribution of average predictions."""
-    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-
-    bins = np.linspace(0, 1, 21)
-
-    ax.hist(baseline_avg_preds, bins=bins, alpha=0.6, label='Baseline', edgecolor='black')
-    ax.hist(obfuscated_avg_preds, bins=bins, alpha=0.6, label='Obfuscated', color='orange', edgecolor='black')
-    ax.set_xlabel('Average Prediction')
-    ax.set_ylabel('Frequency')
-    ax.set_title('Distribution of Average Predictions Across Layers')
-    ax.set_xlim(0, 1)
+    ax.set_xlabel("Mean score across probe layers")
+    ax.set_ylabel("Frequency")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_title("Aggregate probe score distribution")
+    ax.grid(alpha=0.3)
     ax.legend()
-    ax.grid(True, alpha=0.3)
 
-    plt.tight_layout()
-
-    output_file = output_dir / "average_predictions_distribution.png"
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"\nSaved average predictions plot to {output_file}")
-    plt.show()
-
-    # Print statistics
-    print(f"\nBaseline Statistics:")
-    print(f"  Mean: {baseline_avg_preds.mean():.4f}")
-    print(f"  Std: {baseline_avg_preds.std():.4f}")
-    print(f"  Min: {baseline_avg_preds.min():.4f}")
-    print(f"  Max: {baseline_avg_preds.max():.4f}")
-
-    print(f"\nObfuscated Statistics:")
-    print(f"  Mean: {obfuscated_avg_preds.mean():.4f}")
-    print(f"  Std: {obfuscated_avg_preds.std():.4f}")
-    print(f"  Min: {obfuscated_avg_preds.min():.4f}")
-    print(f"  Max: {obfuscated_avg_preds.max():.4f}")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
 
-def plot_logit_distributions(baseline_logits_by_layer, obfuscated_logits_by_layer, output_dir: Path):
-    """Plot logit distributions for each layer."""
-    # Concatenate logits across activation files for each layer
-    baseline_logits_concatenated = {}
-    obfuscated_logits_concatenated = {}
+def _plot_layer_distributions(
+    clean_layer_scores: dict[int, list[float]],
+    obfuscated_layer_scores: dict[int, list[float]] | None,
+    output_path: Path,
+    max_layers: int,
+) -> None:
+    layers = sorted(clean_layer_scores.keys())
+    if not layers:
+        return
 
-    for layer in sorted(baseline_logits_by_layer.keys()):
-        baseline_logits_concatenated[layer] = np.concatenate(baseline_logits_by_layer[layer])
-        obfuscated_logits_concatenated[layer] = np.concatenate(obfuscated_logits_by_layer[layer])
+    layers = layers[:max_layers]
+    num_layers = len(layers)
 
-    # Create 4x7 grid of histograms showing baseline and obfuscated logits at each layer
-    num_layers = len(baseline_logits_concatenated)
-    fig, axes = plt.subplots(4, 7, figsize=(20, 12))
-    axes = axes.flatten()
+    num_cols = min(7, num_layers)
+    num_rows = int(math.ceil(num_layers / num_cols))
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(3.4 * num_cols, 2.8 * num_rows))
+    axes_array = np.atleast_1d(np.array(axes)).reshape(-1)
 
-    # Determine global min/max for consistent binning across all layers
-    all_baseline_logits = np.concatenate([baseline_logits_concatenated[layer] for layer in sorted(baseline_logits_concatenated.keys())])
-    all_obfuscated_logits = np.concatenate([obfuscated_logits_concatenated[layer] for layer in sorted(obfuscated_logits_concatenated.keys())])
-    global_min = min(all_baseline_logits.min(), all_obfuscated_logits.min())
-    global_max = max(all_baseline_logits.max(), all_obfuscated_logits.max())
+    all_values = [np.array(clean_layer_scores[layer], dtype=np.float64) for layer in layers]
+    if obfuscated_layer_scores is not None:
+        all_values += [
+            np.array(obfuscated_layer_scores[layer], dtype=np.float64)
+            for layer in layers
+            if layer in obfuscated_layer_scores
+        ]
+
+    non_empty_values = [arr for arr in all_values if arr.size > 0]
+    if not non_empty_values:
+        raise RuntimeError("No per-layer scores available for plotting.")
+
+    global_min = float(min(arr.min() for arr in non_empty_values))
+    global_max = float(max(arr.max() for arr in non_empty_values))
+    if global_min == global_max:
+        global_min -= 1e-6
+        global_max += 1e-6
     bins = np.linspace(global_min, global_max, 31)
 
-    for idx, layer in enumerate(sorted(baseline_logits_concatenated.keys())):
-        if idx >= 28:  # Only plot first 28 layers (4x7 grid)
-            break
+    for idx, layer in enumerate(layers):
+        ax = axes_array[idx]
 
-        ax = axes[idx]
+        clean_values = np.array(clean_layer_scores[layer], dtype=np.float64)
+        ax.hist(
+            clean_values,
+            bins=bins,
+            alpha=0.65,
+            label="Clean",
+            edgecolor="black",
+            linewidth=0.4,
+        )
 
-        # Plot both baseline and obfuscated logits with same bins
-        ax.hist(baseline_logits_concatenated[layer], bins=bins, alpha=0.6, label='Baseline', edgecolor='black', color='blue')
-        ax.hist(obfuscated_logits_concatenated[layer], bins=bins, alpha=0.6, label='Obfuscated', edgecolor='black', color='orange')
+        if obfuscated_layer_scores is not None and layer in obfuscated_layer_scores:
+            obf_values = np.array(obfuscated_layer_scores[layer], dtype=np.float64)
+            ax.hist(
+                obf_values,
+                bins=bins,
+                alpha=0.65,
+                label="Obfuscated",
+                edgecolor="black",
+                linewidth=0.4,
+                color="orange",
+            )
 
-        ax.set_title(f'Layer {layer}', fontsize=10)
-        ax.set_xlabel('Logits', fontsize=8)
-        ax.set_ylabel('Frequency', fontsize=8)
-        ax.tick_params(labelsize=7)
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=7, loc='upper right')
+        ax.set_title(f"Layer {layer}", fontsize=10)
+        ax.tick_params(labelsize=8)
+        ax.grid(alpha=0.25)
 
-    # Hide any unused subplots
-    for idx in range(num_layers, 28):
-        axes[idx].axis('off')
+    for idx in range(num_layers, len(axes_array)):
+        axes_array[idx].axis("off")
 
-    plt.suptitle('Logit Distributions (Baseline vs Obfuscated) by Layer', fontsize=14, y=0.995)
-    plt.tight_layout()
+    handles, labels = axes_array[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False)
 
-    output_file = output_dir / "logit_distributions_by_layer.png"
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"Saved logit distributions plot to {output_file}")
-    plt.show()
+    fig.suptitle("Per-layer probe score distributions", y=1.02, fontsize=14)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
 
-def main():
+def _default_output_dir(model_name: str, probe_target: str) -> Path:
+    return (
+        Path("outputs/interpretability/probe_output_distribution")
+        / probe_target
+        / normalize_model_name(model_name)
+    )
+
+
+def _build_load_probe_cfg(args: argparse.Namespace) -> Any:
+    checkpoint_paths = None
+    if args.probe_checkpoint_paths:
+        checkpoint_paths = [str(path) for path in args.probe_checkpoint_paths]
+
+    return OmegaConf.create(
+        {
+            "model": {"name_or_path": args.model_name},
+            "probe": {
+                "target": args.probe_target,
+                "loading": {
+                    "checkpoint_dir": (
+                        None
+                        if args.probe_checkpoint_dir is None
+                        else str(args.probe_checkpoint_dir)
+                    ),
+                    "checkpoint_paths": checkpoint_paths,
+                    "layers": args.probe_layers,
+                },
+            },
+            "output": {"probe_dir": str(args.probe_root_dir)},
+        }
+    )
+
+
+def _create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='Analyze probe output distributions for baseline and obfuscated activations.'
+        description=(
+            "Analyze probe score distributions for clean and optionally obfuscated "
+            "inputs using current torch probe checkpoints."
+        )
+    )
+    parser.add_argument("--model-name", type=str, required=True)
+    parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default="Mechanistic-Anomaly-Detection/llama3-jailbreaks",
+    )
+    parser.add_argument("--positive-split", type=str, default="circuit_breakers_test")
+    parser.add_argument("--negative-split", type=str, default="benign_instructions_test")
+    parser.add_argument("--prompt-col", type=str, default="prompt")
+    parser.add_argument("--completion-col", type=str, default="completion")
+
+    parser.add_argument(
+        "--prompt-preprocess",
+        nargs="*",
+        default=["preprocessing.extract_llama_instruction", "preprocessing.strip"],
+        help="Preprocessing callables for prompt text.",
     )
     parser.add_argument(
-        '--probe-dir',
-        type=Path,
-        required=True,
-        help='Directory containing probe .joblib files'
+        "--completion-preprocess",
+        nargs="*",
+        default=None,
+        help="Preprocessing callables for completion text.",
     )
     parser.add_argument(
-        '--activations-dir',
-        type=Path,
-        required=True,
-        help='Directory containing cached activation .pt files'
-    )
-    parser.add_argument(
-        '--output-dir',
-        type=Path,
-        default=Path('.'),
-        help='Directory to save output plots (default: current directory)'
+        "--add-chat-template",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
 
+    parser.add_argument("--probe-target", choices=["input", "generation"], default="input")
+    parser.add_argument("--probe-checkpoint-dir", type=Path, default=None)
+    parser.add_argument(
+        "--probe-checkpoint-paths",
+        type=Path,
+        nargs="*",
+        default=None,
+        help="Explicit probe checkpoint paths. Overrides --probe-checkpoint-dir.",
+    )
+    parser.add_argument("--probe-layers", type=int, nargs="*", default=None)
+    parser.add_argument(
+        "--probe-root-dir",
+        type=Path,
+        default=Path("outputs/probes/harmfulness"),
+        help="Base probe output root when probe checkpoint location is not explicit.",
+    )
+
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--layer-chunk-size", type=int, default=28)
+    parser.add_argument("--probe-device", type=str, default="auto")
+    parser.add_argument(
+        "--include-completion-for-input",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--max-positive-examples", type=int, default=None)
+    parser.add_argument("--max-negative-examples", type=int, default=None)
+    parser.add_argument("--log-every", type=int, default=20)
+
+    parser.add_argument("--suffix-checkpoint-path", type=Path, default=None)
+    parser.add_argument("--optim-token-str", type=str, default="<|optim_str|>")
+
+    parser.add_argument("--device-map", type=str, default="auto")
+    parser.add_argument("--torch-dtype", type=str, default="bfloat16")
+
+    parser.add_argument("--max-layer-plots", type=int, default=28)
+    parser.add_argument("--output-dir", type=Path, default=None)
+
+    return parser
+
+
+def main() -> None:
+    parser = _create_parser()
     args = parser.parse_args()
 
-    # Validate input directories
-    if not args.probe_dir.exists():
-        raise FileNotFoundError(f"Probe directory not found: {args.probe_dir}")
-    if not args.activations_dir.exists():
-        raise FileNotFoundError(f"Activations directory not found: {args.activations_dir}")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be > 0")
+    if args.layer_chunk_size <= 0:
+        raise ValueError("--layer-chunk-size must be > 0")
+    if args.max_layer_plots <= 0:
+        raise ValueError("--max-layer-plots must be > 0")
 
-    # Create output directory if it doesn't exist
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = args.output_dir or _default_output_dir(
+        model_name=args.model_name,
+        probe_target=args.probe_target,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Probe directory: {args.probe_dir}")
-    print(f"Activations directory: {args.activations_dir}")
-    print(f"Output directory: {args.output_dir}")
-    print()
+    print(f"Loading model and tokenizer: {args.model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token_id is None:
+        raise ValueError("Tokenizer has no pad_token_id and no eos_token_id fallback.")
 
-    # Load probes
-    probes_by_layer = load_probes(args.probe_dir)
+    device_map = None if args.device_map in {"none", "null"} else args.device_map
+    torch_dtype = _resolve_torch_dtype(args.torch_dtype)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        device_map=device_map,
+        torch_dtype=torch_dtype,
+    )
+    model.eval()
+    model.config.use_cache = False
+    for param in model.parameters():
+        param.requires_grad_(False)
 
-    # Process activations
-    (baseline_predictions_by_layer, baseline_logits_by_layer,
-     obfuscated_predictions_by_layer, obfuscated_logits_by_layer) = process_activations(
-        args.activations_dir, probes_by_layer
+    print(f"Loading dataset: {args.dataset_name}")
+    positive_dataset = load_dataset(args.dataset_name, split=args.positive_split)
+    negative_dataset = load_dataset(args.dataset_name, split=args.negative_split)
+
+    if args.max_positive_examples is not None:
+        positive_dataset = positive_dataset.select(
+            range(min(len(positive_dataset), int(args.max_positive_examples)))
+        )
+    if args.max_negative_examples is not None:
+        negative_dataset = negative_dataset.select(
+            range(min(len(negative_dataset), int(args.max_negative_examples)))
+        )
+
+    prompt_preprocess = build_preprocessor_pipeline(args.prompt_preprocess)
+    completion_preprocess = build_preprocessor_pipeline(args.completion_preprocess)
+
+    print("Loading probe checkpoints")
+    probe_cfg = _build_load_probe_cfg(args)
+    probes_by_layer, used_probe_paths = load_probes(probe_cfg)
+    probe_layers = sorted(probes_by_layer.keys())
+    if not probe_layers:
+        raise RuntimeError("No probe checkpoints were loaded.")
+
+    probe_device = _resolve_probe_device(args.probe_device)
+    for layer_idx in probe_layers:
+        probe = probes_by_layer[layer_idx].to(probe_device).eval()
+        for param in probe.parameters():
+            param.requires_grad_(False)
+        probes_by_layer[layer_idx] = probe
+
+    optim_embeds: Tensor | None = None
+    if args.suffix_checkpoint_path is not None:
+        set_tokenizer_optim_token(tokenizer, args.optim_token_str)
+        suffix_payload = torch.load(args.suffix_checkpoint_path, map_location="cpu")
+        optim_embeds = suffix_payload["optim_embeds"]
+        if optim_embeds.dim() == 3 and optim_embeds.shape[0] == 1:
+            optim_embeds = optim_embeds.squeeze(0)
+        if optim_embeds.dim() != 2:
+            raise ValueError(
+                "Expected optim_embeds with shape [soft_len, hidden], got "
+                f"{tuple(optim_embeds.shape)}"
+            )
+
+    print("Running clean scoring pass")
+    clean_results = _collect_scores(
+        model=model,
+        tokenizer=tokenizer,
+        positive_dataset=positive_dataset,
+        negative_dataset=negative_dataset,
+        prompt_col=args.prompt_col,
+        completion_col=args.completion_col,
+        prompt_preprocess=prompt_preprocess,
+        completion_preprocess=completion_preprocess,
+        probe_target=args.probe_target,
+        add_chat_template=bool(args.add_chat_template),
+        include_completion_for_input=bool(args.include_completion_for_input),
+        probes_by_layer=probes_by_layer,
+        probe_layers=probe_layers,
+        probe_device=probe_device,
+        batch_size=int(args.batch_size),
+        layer_chunk_size=int(args.layer_chunk_size),
+        log_every=int(args.log_every),
+        optim_embeds=None,
+        optim_token_str=args.optim_token_str,
+        progress_label="clean",
+    )
+    if not clean_results["aggregate_scores"]:
+        raise RuntimeError(
+            "No clean scores were produced. Check preprocessing, probe target, and dataset content."
+        )
+
+    obfuscated_results: dict[str, Any] | None = None
+    if optim_embeds is not None:
+        print("Running obfuscated scoring pass")
+        obfuscated_results = _collect_scores(
+            model=model,
+            tokenizer=tokenizer,
+            positive_dataset=positive_dataset,
+            negative_dataset=negative_dataset,
+            prompt_col=args.prompt_col,
+            completion_col=args.completion_col,
+            prompt_preprocess=prompt_preprocess,
+            completion_preprocess=completion_preprocess,
+            probe_target=args.probe_target,
+            add_chat_template=bool(args.add_chat_template),
+            include_completion_for_input=bool(args.include_completion_for_input),
+            probes_by_layer=probes_by_layer,
+            probe_layers=probe_layers,
+            probe_device=probe_device,
+            batch_size=int(args.batch_size),
+            layer_chunk_size=int(args.layer_chunk_size),
+            log_every=int(args.log_every),
+            optim_embeds=optim_embeds,
+            optim_token_str=args.optim_token_str,
+            progress_label="obfuscated",
+        )
+
+    aggregate_plot_path = output_dir / "aggregate_score_distribution.png"
+    per_layer_plot_path = output_dir / "per_layer_score_distribution.png"
+
+    _plot_aggregate_distribution(
+        clean_scores=clean_results["aggregate_scores"],
+        obfuscated_scores=(
+            None
+            if obfuscated_results is None
+            else obfuscated_results["aggregate_scores"]
+        ),
+        output_path=aggregate_plot_path,
     )
 
-    # Compute and plot average predictions
-    baseline_avg_preds, obfuscated_avg_preds = compute_average_predictions(
-        baseline_predictions_by_layer, obfuscated_predictions_by_layer
+    _plot_layer_distributions(
+        clean_layer_scores=clean_results["layer_scores"],
+        obfuscated_layer_scores=(
+            None
+            if obfuscated_results is None
+            else obfuscated_results["layer_scores"]
+        ),
+        output_path=per_layer_plot_path,
+        max_layers=int(args.max_layer_plots),
     )
-    plot_average_predictions(baseline_avg_preds, obfuscated_avg_preds, args.output_dir)
 
-    # Plot logit distributions
-    plot_logit_distributions(baseline_logits_by_layer, obfuscated_logits_by_layer, args.output_dir)
+    summary: dict[str, Any] = {
+        "model_name": args.model_name,
+        "dataset_name": args.dataset_name,
+        "positive_split": args.positive_split,
+        "negative_split": args.negative_split,
+        "probe_target": args.probe_target,
+        "used_probe_paths": used_probe_paths,
+        "used_probe_layers": probe_layers,
+        "suffix_checkpoint_path": (
+            None
+            if args.suffix_checkpoint_path is None
+            else str(args.suffix_checkpoint_path)
+        ),
+        "clean": {
+            "num_examples": clean_results["num_examples"],
+            "num_positive_examples": clean_results["num_positive_examples"],
+            "num_negative_examples": clean_results["num_negative_examples"],
+            "num_skipped_examples": clean_results["num_skipped_examples"],
+            "aggregate_scores": _describe_scores(clean_results["aggregate_scores"]),
+            "per_layer_scores": {
+                str(layer_idx): _describe_scores(clean_results["layer_scores"][layer_idx])
+                for layer_idx in probe_layers
+            },
+        },
+        "artifacts": {
+            "aggregate_plot": str(aggregate_plot_path),
+            "per_layer_plot": str(per_layer_plot_path),
+        },
+    }
 
-    print("\nAnalysis complete!")
+    if obfuscated_results is not None:
+        clean_mean = summary["clean"]["aggregate_scores"]["mean"]
+        obf_agg = _describe_scores(obfuscated_results["aggregate_scores"])
+
+        summary["obfuscated"] = {
+            "num_examples": obfuscated_results["num_examples"],
+            "num_positive_examples": obfuscated_results["num_positive_examples"],
+            "num_negative_examples": obfuscated_results["num_negative_examples"],
+            "num_skipped_examples": obfuscated_results["num_skipped_examples"],
+            "aggregate_scores": obf_agg,
+            "per_layer_scores": {
+                str(layer_idx): _describe_scores(obfuscated_results["layer_scores"][layer_idx])
+                for layer_idx in probe_layers
+            },
+        }
+
+        obf_mean = obf_agg["mean"]
+        summary["obfuscated_vs_clean_delta"] = {
+            "aggregate_mean_delta": (
+                None
+                if clean_mean is None or obf_mean is None
+                else float(obf_mean - clean_mean)
+            )
+        }
+
+    summary_path = output_dir / "summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"Saved aggregate plot to: {aggregate_plot_path}")
+    print(f"Saved per-layer plot to: {per_layer_plot_path}")
+    print(f"Saved summary to: {summary_path}")
 
 
 if __name__ == "__main__":

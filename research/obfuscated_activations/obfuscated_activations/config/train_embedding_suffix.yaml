@@ -35,7 +35,7 @@ attack:
   lr: 0.0001
   verbose: true
   lambda_behavior: 0.9
-  # lambda_obf: 0.1
+  lambda_obf: null
   probe_type: input
   probe_target: 0.0
   shuffle: true

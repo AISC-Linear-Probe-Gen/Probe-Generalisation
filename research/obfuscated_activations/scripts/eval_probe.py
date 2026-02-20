@@ -221,10 +221,14 @@ def _threshold_at_fpr(
         raise ValueError("No scores produced for threshold calibration.")
     if np.unique(labels_np).shape[0] < 2:
         raise ValueError("Need both positive and negative labels to calibrate threshold.")
+    if not 0.0 <= fpr_target <= 1.0:
+        raise ValueError(f"fpr_target must be in [0, 1], got {fpr_target}")
 
     fpr, tpr, thresholds = roc_curve(labels_np, scores_np)
-    idx = int(np.searchsorted(fpr, fpr_target))
-    idx = min(idx, len(thresholds) - 1)
+    # Choose the operating point whose empirical FPR is closest to the target.
+    # This avoids systematically picking overly permissive thresholds when
+    # FPR jumps coarsely (e.g. small eval subsets).
+    idx = int(np.argmin(np.abs(fpr - fpr_target)))
     return float(thresholds[idx]), float(fpr[idx]), float(tpr[idx])
 
 

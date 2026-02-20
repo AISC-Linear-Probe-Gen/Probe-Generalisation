@@ -19,6 +19,7 @@ def build_softprompt_config(
     attack_cfg: DictConfig,
     seed: int,
 ) -> ProbeObfuscatingSoftPromptConfig:
+    lambda_obf = attack_cfg.get("lambda_obf", None)
     return ProbeObfuscatingSoftPromptConfig(
         num_steps=int(attack_cfg.num_steps),
         num_epochs=int(attack_cfg.num_epochs),
@@ -28,9 +29,7 @@ def build_softprompt_config(
         seed=int(seed),
         verbose=bool(attack_cfg.verbose),
         lambda_behavior=float(attack_cfg.lambda_behavior),
-        lambda_obf=(
-            None if attack_cfg.lambda_obf is None else float(attack_cfg.lambda_obf)
-        ),
+        lambda_obf=(None if lambda_obf is None else float(lambda_obf)),
         probe_type=str(attack_cfg.probe_type),
         probe_target=float(attack_cfg.probe_target),
     )
