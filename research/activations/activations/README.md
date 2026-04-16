@@ -1,1 +1,0 @@
-Collected activations
