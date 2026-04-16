@@ -90,8 +90,6 @@ num_layers = data["num_layers"]
 
 Intermediate checkpoints are saved every `batch_save_freq` samples so progress is not lost if the run is interrupted. Each checkpoint overwrites the previous one; only the final save is complete.
 
----
-
 ## Notes
 
 - The script always extracts the hidden state at the **last token position** of each prompt, which is standard practice for decoder-only models.
