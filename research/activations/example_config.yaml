@@ -1,0 +1,15 @@
+input:
+  parquet_path: /content/train-00000.parquet
+
+model:
+  name: meta-llama/Llama-3.2-3B-Instruct
+  dtype: float16
+
+output:
+  dir: /content/outputs/
+  file: activations.pt
+
+experiment:
+  max_length: 2048
+  batch_save_freq: 50
+  seed: 42
